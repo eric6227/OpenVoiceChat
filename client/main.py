@@ -204,8 +204,8 @@ class AudioPlayer:
         self.stream.close()
 
 
-def send_audio(sock, server_addr, p, listen_own: bool, player: AudioPlayer, encryptor: AudioEncryptor, compressor: AudioCompressor, mute: bool = False, input_device=None, gain: float = 1.0):
-    """Capture microphone audio, apply gain/mute, compress, encrypt, and send to server."""
+def send_audio(sock, p, listen_own: bool, player: AudioPlayer, encryptor: SessionKeyEncryptor, compressor: AudioCompressor, mute: bool = False, input_device=None, gain: float = 1.0):
+    """Capture microphone audio, apply gain/mute, compress, encrypt, and send to server via TCP."""
     kwargs = {
         'format': FORMAT,
         'channels': CHANNELS,
@@ -223,6 +223,7 @@ def send_audio(sock, server_addr, p, listen_own: bool, player: AudioPlayer, encr
         while True:
             data = stream.read(CHUNK, exception_on_overflow=False)
             try:
+                original_data = data
                 if mute:
                     import array
                     samples = array.array('h', data)
@@ -236,16 +237,17 @@ def send_audio(sock, server_addr, p, listen_own: bool, player: AudioPlayer, encr
                     data = samples.tobytes()
                 compressed_data = compressor.compress(data)
                 encrypted_data = encryptor.encrypt(compressed_data)
-                header = struct.pack('!B', MSG_TYPE_AUDIO)
+                timestamp = time.time()
+                header = struct.pack('!B', MSG_TYPE_AUDIO) + struct.pack('!d', timestamp) + struct.pack('!I', len(encrypted_data))
                 packet = header + encrypted_data
-                sock.sendto(packet, server_addr)
+                sock.sendall(packet)
                 
                 packet_count += 1
                 if packet_count % 10 == 0:
-                    logger.debug(f"[Send] Sent #{packet_count}, size: {len(packet)} bytes, target: {server_addr}")
+                    logger.debug(f"[Send] Sent #{packet_count}, size: {len(packet)} bytes")
                 
                 if listen_own and player:
-                    player.push(data)
+                    player.push(original_data)
             except Exception as e:
                 logger.error(f"Failed to send audio: {e}")
                 time.sleep(0.01)
@@ -269,50 +271,68 @@ def send_heartbeat(sock, server_addr, name):
             time.sleep(heartbeat_interval)
 
 
-def receive_audio(sock, player: AudioPlayer, encryptor: AudioEncryptor, compressor: AudioCompressor):
-    """Receive encrypted audio from server, decrypt, decompress, and play."""
+def receive_audio(sock, player: AudioPlayer, encryptor: SessionKeyEncryptor, compressor: AudioCompressor):
+    """Receive encrypted audio from server via TCP, decrypt, decompress, and play."""
     logger.info("Starting to receive audio...")
     packet_count = 0
+    buffer = b''
     
     while True:
         try:
-            sock.settimeout(1)
-            data, addr = sock.recvfrom(MAX_PACKET_SIZE)
-            sock.settimeout(None)
+            data = sock.recv(MAX_PACKET_SIZE)
+            if not data:
+                logger.warning("Server disconnected")
+                break
             
-            packet_count += 1
-            if packet_count % 10 == 0:
-                logger.debug(f"Received packet #{packet_count}, size: {len(data)} bytes, from: {addr}")
+            buffer += data
             
-            if len(data) < 2:
-                logger.debug(f"Packet too short, skipping: {len(data)} bytes")
-                continue
-            
-            msg_type = struct.unpack('!B', data[:1])[0]
-            if packet_count % 10 == 0:
-                logger.debug(f"Message type: {msg_type}")
-            
-            if msg_type == MSG_TYPE_AUDIO:
-                encrypted_data = data[1:]
-                compressed_data = encryptor.decrypt(encrypted_data)
-                if compressed_data:
-                    pcm_data = compressor.decompress(compressed_data)
+            while len(buffer) >= 1:
+                msg_type = struct.unpack('!B', buffer[:1])[0]
+                
+                if msg_type == MSG_TYPE_AUDIO:
+                    # Format: [msg_type(1)][timestamp(8)][encrypted_len(4)][encrypted_audio]
+                    if len(buffer) < 13:  # 1 + 8 + 4
+                        break
+                    
+                    timestamp = struct.unpack('!d', buffer[1:9])[0]
+                    encrypted_len = struct.unpack('!I', buffer[9:13])[0]
+                    
+                    if len(buffer) < 13 + encrypted_len:
+                        break
+                    
+                    encrypted_data = buffer[13:13+encrypted_len]
+                    buffer = buffer[13+encrypted_len:]
+                    
+                    packet_count += 1
                     if packet_count % 10 == 0:
-                        logger.debug(f"Decryption OK, compressed: {len(compressed_data)} bytes, PCM: {len(pcm_data)} bytes")
-                    player.push(pcm_data)
+                        logger.debug(f"Received packet #{packet_count}, size: {len(encrypted_data)} bytes")
+                    
+                    compressed_data = encryptor.decrypt(encrypted_data)
+                    if compressed_data:
+                        pcm_data = compressor.decompress(compressed_data)
+                        if packet_count % 10 == 0:
+                            logger.debug(f"Decryption OK, compressed: {len(compressed_data)} bytes, PCM: {len(pcm_data)} bytes")
+                        player.push(pcm_data)
+                    else:
+                        if packet_count % 10 == 0:
+                            logger.debug("Decryption failed, skipping")
+                elif msg_type == MSG_TYPE_USER_LIST:
+                    if len(buffer) < 2:
+                        break
+                    user_list = buffer[1:].decode('utf-8')
+                    buffer = b''
+                    print(f"\n[Online Users] {user_list}\n")
+                elif msg_type == MSG_TYPE_USER_JOINED:
+                    if len(buffer) < 2:
+                        break
+                    event = buffer[1:].decode('utf-8')
+                    buffer = b''
+                    print(f"\n[User Joined] {event}\n")
                 else:
-                    if packet_count % 10 == 0:
-                        logger.debug("Decryption failed, skipping")
-            elif msg_type == MSG_TYPE_USER_LIST:
-                user_list = data[1:].decode('utf-8')
-                print(f"\n[Online Users] {user_list}\n")
-            elif msg_type == MSG_TYPE_USER_JOINED:
-                event = data[1:].decode('utf-8')
-                print(f"\n[User Joined] {event}\n")
-        except socket.timeout:
-            continue
+                    buffer = buffer[1:]
         except ConnectionResetError:
-            continue
+            logger.warning("Connection reset by server")
+            break
         except Exception as e:
             logger.error(f"Error receiving audio: {e}")
             time.sleep(0.1)
@@ -560,6 +580,19 @@ class VoiceChatGUI:
         self.log_text = scrolledtext.ScrolledText(log_frame, height=10, state=tk.DISABLED, wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True)
         
+    def _recv_exact(self, size):
+        """Receive exactly size bytes from TCP socket."""
+        data = b''
+        while len(data) < size:
+            try:
+                chunk = self.sock_audio.recv(size - len(data))
+                if not chunk:
+                    return None
+                data += chunk
+            except Exception:
+                return None
+        return data
+        
     def _log(self, message):
         """Append a message to the log display. Thread-safe."""
         if self.root and self.root.winfo_exists():
@@ -693,77 +726,49 @@ class VoiceChatGUI:
             
             self.compressor = AudioCompressor(level=6)
             
-            self.sock_audio = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sock_audio.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
-            self.sock_audio.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 512 * 1024)
-            self.sock_audio.bind(('', 0))  # Bind to random port
+            self.sock_audio = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock_audio.settimeout(10)
+            self.root.after(0, self._log, f"正在连接 {host}:{port}...")
+            self.sock_audio.connect((host, port))
+            self.sock_audio.settimeout(None)
             
-            self.sock_signal = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sock_signal.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024)
-            self.sock_signal.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024)
+            name_bytes = name.encode('utf-8')
+            password_bytes = password.encode('utf-8')
+            join_packet = (
+                struct.pack('!BI', MSG_TYPE_JOIN, len(name_bytes)) + name_bytes +
+                struct.pack('!I', len(password_bytes)) + password_bytes
+            )
+            self.root.after(0, self._log, f"发送加入请求，包大小: {len(join_packet)} 字节")
+            self.sock_audio.sendall(join_packet)
             
-            self.signal_addr = (host, 9092)
-            self.server_addr = (host, port)
+            self.root.after(0, self._log, "等待服务器响应...")
+            response_data = self._recv_exact(61)
+            if not response_data or len(response_data) < 1:
+                raise Exception("服务器响应格式错误")
             
-            max_retries = 10
-            retry_interval = 2
-            connected = False
+            response_type = struct.unpack('!B', response_data[:1])[0]
+            self.root.after(0, self._log, f"收到响应类型: {response_type}")
             
-            for attempt in range(max_retries):
-                try:
-                    name_bytes = name.encode('utf-8')
-                    password_bytes = password.encode('utf-8')
-                    audio_port = self.sock_audio.getsockname()[1]
-                    # JOIN packet: [msg_type(1)][name_len(4)][name][password_len(4)][password][audio_port(2)]
-                    join_packet = (
-                        struct.pack('!BI', MSG_TYPE_JOIN, len(name_bytes)) + name_bytes +
-                        struct.pack('!I', len(password_bytes)) + password_bytes +
-                        struct.pack('!H', audio_port)
-                    )
-                    self.sock_signal.sendto(join_packet, self.signal_addr)
-                    self.root.after(0, self._log, f"发送加入请求（第{attempt+1}次），音频端口: {audio_port}")
-                    
-                    self.sock_signal.settimeout(5)
-                    response_data, _ = self.sock_signal.recvfrom(MAX_PACKET_SIZE)
-                    self.sock_signal.settimeout(None)
-                    
-                    if len(response_data) < 1:
-                        raise Exception("服务器响应格式错误")
-                    
-                    response_type = struct.unpack('!B', response_data[:1])[0]
-                    
-                    if response_type == MSG_TYPE_AUTH_FAIL:
-                        raise Exception("密码错误，身份验证失败")
-                    elif response_type == MSG_TYPE_AUTH_SUCCESS:
-                        # Extract encrypted session key: [msg_type(1)][nonce(12)][tag(16)][encrypted_key(32)]
-                        if len(response_data) < 61:
-                            raise Exception("服务器响应格式错误")
-                        
-                        nonce = response_data[1:13]
-                        tag = response_data[13:29]
-                        encrypted_session_key = response_data[29:]
-                        
-                        # Decrypt session key using password-derived key
-                        salt = hashlib.sha256(password.encode('utf-8')).digest()
-                        derived_key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
-                        cipher = AES.new(derived_key, AES.MODE_GCM, nonce=nonce)
-                        self.session_key = cipher.decrypt_and_verify(encrypted_session_key, tag)
-                        
-                        # Initialize audio encryptor with session key
-                        self.audio_encryptor = SessionKeyEncryptor(self.session_key)
-                        
-                        connected = True
-                        break
-                    else:
-                        raise Exception("未知的服务器响应")
-                except socket.timeout:
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_interval)
-                    else:
-                        raise Exception("无法连接到服务器")
-                    
-            if not connected:
-                raise Exception("连接服务器失败")
+            if response_type == MSG_TYPE_AUTH_FAIL:
+                raise Exception("密码错误，身份验证失败")
+            elif response_type == MSG_TYPE_AUTH_SUCCESS:
+                if len(response_data) < 61:
+                    raise Exception("服务器响应格式错误")
+                
+                nonce = response_data[1:13]
+                tag = response_data[13:29]
+                encrypted_session_key = response_data[29:61]
+                
+                salt = hashlib.sha256(password.encode('utf-8')).digest()
+                derived_key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
+                cipher = AES.new(derived_key, AES.MODE_GCM, nonce=nonce)
+                self.session_key = cipher.decrypt_and_verify(encrypted_session_key, tag)
+                
+                self.audio_encryptor = SessionKeyEncryptor(self.session_key)
+                
+                connected = True
+            else:
+                raise Exception("未知的服务器响应")
                 
             self.p = pyaudio.PyAudio()
             self.player = AudioPlayer(self.p)
@@ -778,10 +783,6 @@ class VoiceChatGUI:
             receive_thread = threading.Thread(target=self._receive_audio, daemon=True)
             receive_thread.start()
             self._active_threads.append(receive_thread)
-            
-            heartbeat_thread = threading.Thread(target=self._send_heartbeat, daemon=True)
-            heartbeat_thread.start()
-            self._active_threads.append(heartbeat_thread)
             
             self.root.after(0, self._connect_success, name)
             
@@ -829,12 +830,12 @@ class VoiceChatGUI:
         self.running = False
         self.connected = False
         
-        # Send LEAVE message, wait briefly to ensure it's sent
+        # Send LEAVE message
         try:
-            if self.name and self.sock_signal:
+            if self.name and self.sock_audio:
                 name_bytes = self.name.encode('utf-8')
                 leave_packet = struct.pack('!BI', MSG_TYPE_LEAVE, len(name_bytes)) + name_bytes
-                self.sock_signal.sendto(leave_packet, self.signal_addr)
+                self.sock_audio.sendall(leave_packet)
                 import time
                 time.sleep(0.3)
         except Exception:
@@ -872,20 +873,13 @@ class VoiceChatGUI:
                 pass
             self.player = None
             
-        # Close network sockets
+        # Close network socket
         if self.sock_audio:
             try:
                 self.sock_audio.close()
             except Exception:
                 pass
             self.sock_audio = None
-            
-        if self.sock_signal:
-            try:
-                self.sock_signal.close()
-            except Exception:
-                pass
-            self.sock_signal = None
             
         # Terminate PyAudio - this will close all streams opened with this instance
         if self.p:
@@ -971,14 +965,12 @@ class VoiceChatGUI:
         self._listen_btn_lock = False
             
     def _send_audio(self):
-        """Capture microphone audio and send to server."""
+        """Capture microphone audio and send to server via TCP."""
         try:
-            # Check if audio encryptor is initialized
             if not hasattr(self, 'audio_encryptor') or self.audio_encryptor is None:
                 self._log("音频加密模块未初始化，无法发送音频")
                 return
             
-            # Capture values from tkinter variables in a thread-safe way
             gain = self.config.get('gain', 1.0)
             
             kwargs = {
@@ -1009,11 +1001,11 @@ class VoiceChatGUI:
                         
                     compressed_data = self.compressor.compress(data)
                     encrypted_data = self.audio_encryptor.encrypt(compressed_data)
-                    header = struct.pack('!B', MSG_TYPE_AUDIO)
+                    timestamp = time.time()
+                    header = struct.pack('!B', MSG_TYPE_AUDIO) + struct.pack('!d', timestamp) + struct.pack('!I', len(encrypted_data))
                     packet = header + encrypted_data
-                    self.sock_audio.sendto(packet, self.server_addr)
+                    self.sock_audio.sendall(packet)
                     
-                    # Play own audio locally if monitoring is enabled
                     if self.listen_own and self.player and not self.local_listen_running:
                         self.player.push(original_data)
                 except Exception as e:
@@ -1107,55 +1099,63 @@ class VoiceChatGUI:
                 time.sleep(0.01)
             
     def _receive_audio(self):
-        """Receive and process incoming audio from server."""
+        """Receive and process incoming audio from server via TCP."""
         self._log("开始接收音频...")
         audio_count = 0
+        buffer = b''
         
         while self.running:
             try:
-                self.sock_audio.settimeout(1)
-                data, addr = self.sock_audio.recvfrom(MAX_PACKET_SIZE)
-                self.sock_audio.settimeout(None)
+                data = self.sock_audio.recv(MAX_PACKET_SIZE)
+                if not data:
+                    self._log("服务器断开连接")
+                    break
                 
-                if len(data) < 2:
-                    continue
+                buffer += data
+                
+                while len(buffer) >= 1:
+                    msg_type = struct.unpack('!B', buffer[:1])[0]
                     
-                msg_type = struct.unpack('!B', data[:1])[0]
-                
-                if msg_type == MSG_TYPE_AUDIO:
-                    if not self.audio_encryptor:
-                        continue
-                    audio_count += 1
-                    encrypted_data = data[1:]
-                    compressed_data = self.audio_encryptor.decrypt(encrypted_data)
-                    if compressed_data and self.compressor:
-                        pcm_data = self.compressor.decompress(compressed_data)
-                        if self.player:
-                            self.player.push(pcm_data)
-                elif msg_type == MSG_TYPE_USER_LIST:
-                    user_list = data[1:].decode('utf-8')
-                    self.root.after(0, self._update_users, user_list)
-                elif msg_type == MSG_TYPE_USER_JOINED:
-                    event = data[1:].decode('utf-8')
-                    self.root.after(0, self._log, f"[用户事件] {event}")
-            except socket.timeout:
-                continue
+                    if msg_type == MSG_TYPE_AUDIO:
+                        # Format: [msg_type(1)][timestamp(8)][encrypted_len(4)][encrypted_audio]
+                        if len(buffer) < 13:
+                            break
+                        
+                        timestamp = struct.unpack('!d', buffer[1:9])[0]
+                        encrypted_len = struct.unpack('!I', buffer[9:13])[0]
+                        
+                        if len(buffer) < 13 + encrypted_len:
+                            break
+                        
+                        encrypted_data = buffer[13:13+encrypted_len]
+                        buffer = buffer[13+encrypted_len:]
+                        
+                        if not self.audio_encryptor:
+                            continue
+                            
+                        audio_count += 1
+                        compressed_data = self.audio_encryptor.decrypt(encrypted_data)
+                        if compressed_data and self.compressor:
+                            pcm_data = self.compressor.decompress(compressed_data)
+                            if self.player:
+                                self.player.push(pcm_data)
+                    elif msg_type == MSG_TYPE_USER_LIST:
+                        user_list = buffer[1:].decode('utf-8')
+                        buffer = b''
+                        self.root.after(0, self._update_users, user_list)
+                    elif msg_type == MSG_TYPE_USER_JOINED:
+                        event = buffer[1:].decode('utf-8')
+                        buffer = b''
+                        self.root.after(0, self._log, f"[用户事件] {event}")
+                    else:
+                        buffer = buffer[1:]
+            except ConnectionResetError:
+                self._log("连接被服务器重置")
+                break
             except Exception as e:
                 if self.running:
                     self._log(f"接收音频出错: {e}")
                 time.sleep(0.1)
-                
-    def _send_heartbeat(self):
-        heartbeat_interval = 3
-        while self.running:
-            try:
-                name_bytes = self.name.encode('utf-8')
-                audio_port = self.sock_audio.getsockname()[1]
-                heartbeat_packet = struct.pack('!BI', MSG_TYPE_HEARTBEAT, len(name_bytes)) + name_bytes + struct.pack('!H', audio_port)
-                self.sock_signal.sendto(heartbeat_packet, self.signal_addr)
-                time.sleep(heartbeat_interval)
-            except Exception:
-                time.sleep(heartbeat_interval)
                 
     def on_closing(self):
         if self.connected:
@@ -1269,56 +1269,64 @@ def main():
     encryptor = AudioEncryptor(password)
     compressor = AudioCompressor(level=args.compress_level)
 
-    sock_audio = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock_audio.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
-    sock_audio.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 512 * 1024)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     
-    sock_signal = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock_signal.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024)
-    sock_signal.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024)
-    
-    signal_addr = (host, 9092)
-    audio_addr = (host, port)
-
     logger.info(f"正在连接服务器 {host}:{port}...")
     
-    max_retries = 10
-    retry_interval = 2
-    connected = False
-    
-    for attempt in range(max_retries):
-        try:
-            name_bytes = name.encode('utf-8')
-            join_packet = struct.pack('!BI', MSG_TYPE_JOIN, len(name_bytes)) + name_bytes
-            sock_signal.sendto(join_packet, signal_addr)
-            
-            sock_signal.settimeout(3)
-            test_data, _ = sock_signal.recvfrom(MAX_PACKET_SIZE)
-            sock_signal.settimeout(None)
-            
-            connected = True
-            logger.info(f"已加入服务器，昵称: {name}，监听自己: {'是' if listen_own else '否'}")
-            break
-        except socket.timeout:
-            if attempt < max_retries - 1:
-                logger.info(f"服务器未响应，重试 {attempt + 1}/{max_retries}...")
-                time.sleep(retry_interval)
-            else:
-                logger.error(f"无法连接到服务器 {host}:{port}")
-                sock_signal.close()
-                sock_audio.close()
-                return
-        except Exception as e:
-            logger.error(f"连接失败: {e}")
-            sock_signal.close()
-            sock_audio.close()
-            return
-    
-    if not connected:
-        logger.error("连接服务器失败")
-        sock_signal.close()
-        sock_audio.close()
+    try:
+        sock.settimeout(10)
+        sock.connect((host, port))
+        sock.settimeout(None)
+    except Exception as e:
+        logger.error(f"无法连接到服务器 {host}:{port}: {e}")
+        sock.close()
         return
+    
+    name_bytes = name.encode('utf-8')
+    password_bytes = password.encode('utf-8')
+    join_packet = (
+        struct.pack('!BI', MSG_TYPE_JOIN, len(name_bytes)) + name_bytes +
+        struct.pack('!I', len(password_bytes)) + password_bytes
+    )
+    sock.sendall(join_packet)
+    
+    response_data = b''
+    while len(response_data) < 61:
+        chunk = sock.recv(61 - len(response_data))
+        if not chunk:
+            logger.error("服务器响应不完整")
+            sock.close()
+            return
+        response_data += chunk
+    
+    if len(response_data) < 1:
+        logger.error("服务器响应格式错误")
+        sock.close()
+        return
+    
+    response_type = struct.unpack('!B', response_data[:1])[0]
+    
+    if response_type == MSG_TYPE_AUTH_FAIL:
+        logger.error("密码错误，身份验证失败")
+        sock.close()
+        return
+    elif response_type != MSG_TYPE_AUTH_SUCCESS:
+        logger.error("未知的服务器响应")
+        sock.close()
+        return
+    
+    nonce = response_data[1:13]
+    tag = response_data[13:29]
+    encrypted_session_key = response_data[29:61]
+    
+    salt = hashlib.sha256(password.encode('utf-8')).digest()
+    derived_key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
+    cipher = AES.new(derived_key, AES.MODE_GCM, nonce=nonce)
+    session_key = cipher.decrypt_and_verify(encrypted_session_key, tag)
+    
+    audio_encryptor = SessionKeyEncryptor(session_key)
+    
+    logger.info(f"已加入服务器，昵称: {name}，监听自己: {'是' if listen_own else '否'}")
         
     print("=" * 50)
     print("语音聊天已连接！按 Ctrl+C 退出。")
@@ -1331,14 +1339,11 @@ def main():
     if listen_own:
         logger.info("已启用监听自己的语音功能")
 
-    send_thread = threading.Thread(target=send_audio, args=(sock_audio, audio_addr, p, listen_own, player, encryptor, compressor, mute, args.input_device), daemon=True)
+    send_thread = threading.Thread(target=send_audio, args=(sock, p, listen_own, player, audio_encryptor, compressor, mute, args.input_device), daemon=True)
     send_thread.start()
 
-    receive_thread = threading.Thread(target=receive_audio, args=(sock_audio, player, encryptor, compressor), daemon=True)
+    receive_thread = threading.Thread(target=receive_audio, args=(sock, player, audio_encryptor, compressor), daemon=True)
     receive_thread.start()
-    
-    heartbeat_thread = threading.Thread(target=send_heartbeat, args=(sock_signal, signal_addr, name), daemon=True)
-    heartbeat_thread.start()
 
     try:
         send_thread.join()
@@ -1347,13 +1352,12 @@ def main():
         try:
             name_bytes = name.encode('utf-8')
             leave_packet = struct.pack('!BI', MSG_TYPE_LEAVE, len(name_bytes)) + name_bytes
-            sock_signal.sendto(leave_packet, signal_addr)
+            sock.sendall(leave_packet)
         except Exception:
             pass
     finally:
         player.stop()
-        sock_audio.close()
-        sock_signal.close()
+        sock.close()
         p.terminate()
         logger.info("已断开连接")
 

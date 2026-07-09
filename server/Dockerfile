@@ -9,6 +9,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 
-EXPOSE 9090/udp 9091/udp 9092/udp 9093/udp
+EXPOSE 9090/tcp 9091/tcp
 
 CMD ["python", "main.py"]

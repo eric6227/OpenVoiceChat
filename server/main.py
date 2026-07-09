@@ -5,29 +5,25 @@ import logging
 import argparse
 import time
 import hashlib
+import os
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
 
 logger = logging.getLogger(__name__)
 
-# Server password - CHANGE THIS TO A STRONG PASSWORD!
-SERVER_PASSWORD = "OpenVoiceChat2026!"
+# Server password - can be set via OVC_PASSWORD environment variable
+_env_password = os.environ.get("OVC_PASSWORD")
+if _env_password:
+    SERVER_PASSWORD = _env_password
+    logger.info(f"Using password from OVC_PASSWORD environment variable")
+else:
+    SERVER_PASSWORD = "OpenVoiceChat2026!"
+    logger.info("Using default password (OVC_PASSWORD not set)")
 
 HOST = '0.0.0.0'
-PORT = 9090           # Client audio data port
-ADMIN_PORT = 9091     # Admin audio data port
-SIGNAL_PORT = 9092    # Client signal port
-ADMIN_SIGNAL_PORT = 9093  # Admin signal port
+CLIENT_PORT = 9090
+ADMIN_PORT = 9091
 MAX_PACKET_SIZE = 65536
-
-clients = {}          # {addr: {'name': str, 'last_heartbeat': float, 'session_key': bytes}}
-admins = {}           # {addr: {'name': str, 'last_heartbeat': float, 'session_key': bytes}}
-clients_lock = threading.Lock()
-HEARTBEAT_TIMEOUT = 10  # Seconds before a client is considered disconnected
-
-# Signaling sockets (global, used by broadcast functions)
-sock_client_signal = None
-sock_admin_signal = None
 
 # Message type constants
 MSG_TYPE_JOIN = 1
@@ -40,60 +36,23 @@ MSG_TYPE_LEAVE = 8
 MSG_TYPE_AUTH_SUCCESS = 9
 MSG_TYPE_AUTH_FAIL = 10
 
+# Audio packet timeout (milliseconds) - drop packets older than this
+AUDIO_PACKET_TIMEOUT_MS = 200
 
-def broadcast_user_list():
-    """Send the current user list to all connected clients and admins."""
-    with clients_lock:
-        user_names = [info['name'] for info in clients.values()]
-        admin_names = [info['name'] for info in admins.values()]
-    
-    # Build different list messages for clients vs admins
-    user_list_data = "Users: " + ", ".join(user_names)
-    admin_list_data = "Users: " + ", ".join(user_names) + " | Admins: " + ", ".join(admin_names)
-    
-    user_header = struct.pack('!B', MSG_TYPE_USER_LIST)
-    
-    with clients_lock:
-        client_addrs = list(clients.keys())
-        admin_addrs = list(admins.keys())
-    
-    for addr in client_addrs:
-        try:
-            packet = user_header + user_list_data.encode('utf-8')
-            sock_client_signal.sendto(packet, addr)
-        except Exception:
-            pass
-    
-    for addr in admin_addrs:
-        try:
-            packet = user_header + admin_list_data.encode('utf-8')
-            sock_admin_signal.sendto(packet, addr)
-        except Exception:
-            pass
+class ClientInfo:
+    """Stores information about a connected client."""
+    def __init__(self, conn, name, session_key, is_admin=False):
+        self.conn = conn
+        self.name = name
+        self.session_key = session_key
+        self.is_admin = is_admin
+        self.last_heartbeat = time.time()
+        self.lock = threading.Lock()
 
-
-def broadcast_user_event(event_type, name):
-    """Broadcast a user join/leave event to all clients and admins."""
-    event_data = f"{name} has joined" if event_type == MSG_TYPE_USER_JOINED else f"{name} has left"
-    event_bytes = event_data.encode('utf-8')
-    header = struct.pack('!B', event_type)
-    packet = header + event_bytes
-    
-    with clients_lock:
-        client_addrs = list(clients.keys())
-        admin_addrs = list(admins.keys())
-    
-    for addr in client_addrs:
-        try:
-            sock_client_signal.sendto(packet, addr)
-        except Exception:
-            pass
-    
-    for addr in admin_addrs:
-        try:
-            sock_admin_signal.sendto(packet, addr)
-        except Exception:
-            pass
+clients = []  # List of ClientInfo (non-admin)
+admins = []   # List of ClientInfo (admin)
+global_lock = threading.Lock()
+HEARTBEAT_TIMEOUT = 10  # Seconds before a client is considered disconnected
 
 
 def server_decrypt_with_key(data: bytes, key: bytes) -> bytes:
@@ -109,6 +68,7 @@ def server_decrypt_with_key(data: bytes, key: bytes) -> bytes:
     except Exception:
         return None
 
+
 def server_encrypt_with_key(data: bytes, key: bytes) -> bytes:
     """Encrypt audio data using a specific session key."""
     nonce = get_random_bytes(12)
@@ -117,431 +77,467 @@ def server_encrypt_with_key(data: bytes, key: bytes) -> bytes:
     return nonce + tag + ciphertext
 
 
-def broadcast_audio(data, sender_addr):
-    """
-    Receive encrypted audio from a client, decrypt it with sender's session key,
-    re-encrypt with each recipient's session key, and broadcast.
-    """
-    # Strip the message type byte, then decrypt with sender's session key
-    encrypted_data = data[1:]
+def broadcast_user_list():
+    """Send the current user list to all connected clients and admins."""
+    with global_lock:
+        user_names = [c.name for c in clients]
+        admin_names = [a.name for a in admins]
     
-    # Find sender's session key
-    sender_session_key = None
-    with clients_lock:
-        if sender_addr in clients:
-            sender_session_key = clients[sender_addr].get('session_key')
-        elif sender_addr in admins:
-            sender_session_key = admins[sender_addr].get('session_key')
+    user_list_data = "Users: " + ", ".join(user_names)
+    admin_list_data = "Users: " + ", ".join(user_names) + " | Admins: " + ", ".join(admin_names)
     
-    if sender_session_key is None:
-        return  # Unknown sender, discard
+    user_header = struct.pack('!B', MSG_TYPE_USER_LIST)
     
-    decrypted_data = server_decrypt_with_key(encrypted_data, sender_session_key)
-    if decrypted_data is None:
-        return  # Decryption failed, discard
+    with global_lock:
+        all_clients = list(clients)
+        all_admins = list(admins)
     
-    with clients_lock:
-        client_addrs = list(clients.keys())
-        admin_addrs = list(admins.keys())
-
-    # Forward to all clients except the sender
-    for addr in client_addrs:
-        if addr == sender_addr:
-            continue
+    for client in all_clients:
         try:
-            recipient_key = clients[addr].get('session_key')
-            if recipient_key:
-                re_encrypted_data = server_encrypt_with_key(decrypted_data, recipient_key)
-                re_packet = struct.pack('!B', MSG_TYPE_AUDIO) + re_encrypted_data
-                sock_client.sendto(re_packet, addr)
-        except Exception as e:
-            logger.error(f"Send failed to {addr}: {e}")
-            with clients_lock:
-                if addr in clients:
-                    clients.pop(addr)
-
-    # Forward to all admins
-    for addr in admin_addrs:
-        try:
-            recipient_key = admins[addr].get('session_key')
-            if recipient_key:
-                re_encrypted_data = server_encrypt_with_key(decrypted_data, recipient_key)
-                re_packet = struct.pack('!B', MSG_TYPE_AUDIO) + re_encrypted_data
-                sock_admin.sendto(re_packet, addr)
-        except Exception as e:
-            logger.error(f"Send failed to {addr}: {e}")
-            with clients_lock:
-                if addr in admins:
-                    admins.pop(addr)
-
-
-def handle_user_signal():
-    """Handle client signaling: JOIN, HEARTBEAT, LEAVE messages."""
-    global sock_client_signal
-    sock_client_signal = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock_client_signal.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock_client_signal.bind((HOST, SIGNAL_PORT))
-    logger.info(f"Client signal server started, listening on {HOST}:{SIGNAL_PORT}")
+            packet = user_header + user_list_data.encode('utf-8')
+            client.conn.sendall(packet)
+        except Exception:
+            pass
     
-    while True:
+    for admin in all_admins:
         try:
-            data, addr = sock_client_signal.recvfrom(MAX_PACKET_SIZE)
+            packet = user_header + admin_list_data.encode('utf-8')
+            admin.conn.sendall(packet)
+        except Exception:
+            pass
+
+
+def broadcast_user_event(event_type, name):
+    """Broadcast a user join/leave event to all clients and admins."""
+    event_data = f"{name} has joined" if event_type == MSG_TYPE_USER_JOINED else f"{name} has left"
+    event_bytes = event_data.encode('utf-8')
+    header = struct.pack('!B', event_type)
+    packet = header + event_bytes
+    
+    with global_lock:
+        all_clients = list(clients)
+        all_admins = list(admins)
+    
+    for client in all_clients:
+        try:
+            client.conn.sendall(packet)
+        except Exception:
+            pass
+    
+    for admin in all_admins:
+        try:
+            admin.conn.sendall(packet)
+        except Exception:
+            pass
+
+
+def handle_client(conn, addr, is_admin=False):
+    """Handle a single client connection."""
+    role = "admin" if is_admin else "client"
+    logger.info(f"{role.capitalize()} connected from {addr}")
+    
+    try:
+        # Set socket timeout for initial handshake
+        conn.settimeout(10)
+        
+        # Receive JOIN message
+        data = b''
+        while len(data) < 2:
+            chunk = conn.recv(MAX_PACKET_SIZE)
+            if not chunk:
+                logger.warning(f"{role.capitalize()} disconnected before sending JOIN")
+                return
+            data += chunk
+        
+        logger.info(f"[{role}] Received {len(data)} bytes for initial packet, data: {data[:20].hex()}")
+        msg_type = struct.unpack('!B', data[:1])[0]
+        logger.info(f"[{role}] Message type: {msg_type}")
+        
+        if msg_type == MSG_TYPE_JOIN:
+            # Parse JOIN packet: [msg_type(1)][name_len(4)][name][password_len(4)][password]
+            offset = 1
+            name_len = struct.unpack('!I', data[offset:offset+4])[0]
+            offset += 4
+            logger.info(f"[{role}] Name length: {name_len}")
             
-            if len(data) < 2:
-                continue
-
-            msg_type = struct.unpack('!B', data[:1])[0]
+            if name_len == 0 or name_len > 128:
+                logger.warning(f"Invalid username length: {name_len}")
+                return
             
-            if msg_type == MSG_TYPE_JOIN:
+            # Wait for more data if needed
+            while len(data) < offset + name_len:
+                chunk = conn.recv(MAX_PACKET_SIZE)
+                if not chunk:
+                    logger.warning(f"[{role}] Disconnected while reading name")
+                    return
+                data += chunk
+                logger.info(f"[{role}] Received more data for name, total: {len(data)}")
+            
+            name = data[offset:offset+name_len].decode('utf-8')
+            offset += name_len
+            logger.info(f"[{role}] Name: {name}")
+            
+            password_len = struct.unpack('!I', data[offset:offset+4])[0]
+            offset += 4
+            logger.info(f"[{role}] Password length: {password_len}")
+            
+            if password_len == 0 or password_len > 256:
+                logger.warning(f"Invalid password length: {password_len}")
+                return
+            
+            while len(data) < offset + password_len:
+                chunk = conn.recv(MAX_PACKET_SIZE)
+                if not chunk:
+                    logger.warning(f"[{role}] Disconnected while reading password")
+                    return
+                data += chunk
+                logger.info(f"[{role}] Received more data for password, total: {len(data)}")
+            
+            password = data[offset:offset+password_len].decode('utf-8')
+            logger.info(f"[{role}] Password received, verifying...")
+            
+            # Verify password
+            if password != SERVER_PASSWORD:
+                logger.warning(f"User [{name}] authentication failed from {addr}")
+                fail_packet = struct.pack('!B', MSG_TYPE_AUTH_FAIL)
+                conn.sendall(fail_packet)
+                return
+            
+            logger.info(f"[{role}] Password verified, generating session key...")
+            
+            # Generate session key
+            session_key = get_random_bytes(32)
+            logger.info(f"[{role}] Session key generated")
+            
+            # Send auth success with encrypted session key
+            salt = hashlib.sha256(password.encode('utf-8')).digest()
+            derived_key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
+            nonce = get_random_bytes(12)
+            cipher = AES.new(derived_key, AES.MODE_GCM, nonce=nonce)
+            encrypted_session_key, tag = cipher.encrypt_and_digest(session_key)
+            logger.info(f"[{role}] Encrypted session key prepared")
+            
+            response = struct.pack('!B', MSG_TYPE_AUTH_SUCCESS) + nonce + tag + encrypted_session_key
+            logger.info(f"[{role}] Sending auth success response ({len(response)} bytes)...")
+            conn.sendall(response)
+            logger.info(f"[{role}] Auth success response sent")
+            
+            # Create client info
+            client_info = ClientInfo(conn, name, session_key, is_admin)
+            logger.info(f"[{role}] Created client info object")
+            
+            with global_lock:
+                if is_admin:
+                    admins.append(client_info)
+                    logger.info(f"Admin [{name}] joined and authenticated (total: {len(admins)})")
+                else:
+                    clients.append(client_info)
+                    logger.info(f"User [{name}] joined and authenticated (total: {len(clients)})")
+            
+            # Broadcast outside of lock to avoid deadlock
+            if not is_admin:
+                logger.info(f"[{role}] About to broadcast user event...")
                 try:
-                    # Parse JOIN packet: [msg_type(1)][name_len(4)][name][password_len(4)][password][audio_port(2)]
-                    offset = 1
-                    name_len = struct.unpack('!I', data[offset:offset+4])[0]
-                    offset += 4
-                    
-                    if name_len == 0 or name_len > 128:
-                        logger.warning(f"Invalid username length: {name_len}")
-                        continue
-                    
-                    name = data[offset:offset+name_len].decode('utf-8')
-                    offset += name_len
-                    
-                    # Extract password
-                    password_len = struct.unpack('!I', data[offset:offset+4])[0]
-                    offset += 4
-                    
-                    if password_len == 0 or password_len > 256:
-                        logger.warning(f"Invalid password length: {password_len}")
-                        continue
-                    
-                    password = data[offset:offset+password_len].decode('utf-8')
-                    offset += password_len
-                    
-                    # Verify password
-                    if password != SERVER_PASSWORD:
-                        logger.warning(f"User [{name}] authentication failed from {addr}")
-                        # Send auth failure response
-                        fail_packet = struct.pack('!B', MSG_TYPE_AUTH_FAIL)
-                        sock_client_signal.sendto(fail_packet, addr)
-                        continue
-                    
-                    # Generate session key for this client
-                    session_key = get_random_bytes(32)
-                    
-                    # Extract audio port
-                    has_audio_port = len(data) >= offset + 2
-                    client_audio_port = None
-                    if has_audio_port:
-                        client_audio_port = struct.unpack('!H', data[offset:offset+2])[0]
-                    
-                    client_addr = (addr[0], client_audio_port) if client_audio_port else addr
-                    
-                    with clients_lock:
-                        clients[client_addr] = {
-                            'name': name, 
-                            'last_heartbeat': time.time(),
-                            'session_key': session_key
-                        }
-                    
-                    logger.info(f"User [{name}] joined and authenticated (total: {len(clients)}), audio addr: {client_addr}")
-                    
-                    # Send auth success with encrypted session key
-                    # Encrypt session key using password-derived key
-                    salt = hashlib.sha256(password.encode('utf-8')).digest()
-                    derived_key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
-                    nonce = get_random_bytes(12)
-                    cipher = AES.new(derived_key, AES.MODE_GCM, nonce=nonce)
-                    encrypted_session_key, tag = cipher.encrypt_and_digest(session_key)
-                    
-                    response = struct.pack('!B', MSG_TYPE_AUTH_SUCCESS) + nonce + tag + encrypted_session_key
-                    sock_client_signal.sendto(response, addr)
-                    
                     broadcast_user_event(MSG_TYPE_USER_JOINED, name)
-                    broadcast_user_list()
+                    logger.info(f"[{role}] Broadcast user event completed")
                 except Exception as e:
-                    logger.error(f"Error handling user join: {e}")
-            
-            elif msg_type == MSG_TYPE_HEARTBEAT:
+                    logger.error(f"[{role}] Error broadcasting user event: {e}")
                 try:
-                    name_len = struct.unpack('!I', data[1:5])[0]
-                    if name_len == 0 or name_len > 128:
-                        continue
-                    
-                    name = data[5:5+name_len].decode('utf-8')
-                    has_audio_port = len(data) >= 5 + name_len + 2
-                    client_audio_port = None
-                    if has_audio_port:
-                        client_audio_port = struct.unpack('!H', data[5+name_len:7+name_len])[0]
-                    
-                    client_addr = (addr[0], client_audio_port) if client_audio_port else addr
-                    
-                    with clients_lock:
-                        if client_addr in clients:
-                            clients[client_addr]['last_heartbeat'] = time.time()
-                        else:
-                            clients[client_addr] = {'name': name, 'last_heartbeat': time.time()}
-                            logger.info(f"User [{name}] reconnected")
-                except Exception:
-                    pass
+                    broadcast_user_list()
+                    logger.info(f"[{role}] Broadcast user list completed")
+                except Exception as e:
+                    logger.error(f"[{role}] Error broadcasting user list: {e}")
             
-            elif msg_type == MSG_TYPE_LEAVE:
-                try:
-                    name_len = struct.unpack('!I', data[1:5])[0]
-                    if name_len == 0 or name_len > 128:
-                        continue
-                    
-                    name = data[5:5+name_len].decode('utf-8')
-                    has_audio_port = len(data) >= 5 + name_len + 2
-                    client_audio_port = None
-                    if has_audio_port:
-                        client_audio_port = struct.unpack('!H', data[5+name_len:7+name_len])[0]
-                    
-                    client_addr = (addr[0], client_audio_port) if client_audio_port else addr
-                    
-                    with clients_lock:
-                        if client_addr in clients:
-                            del clients[client_addr]
-                            logger.info(f"User [{name}] left (total: {len(clients)})")
-                            broadcast_user_event(MSG_TYPE_USER_JOINED, name)
-                            broadcast_user_list()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            logger.info(f"[{role}] Setting socket to non-blocking...")
+            # Set socket to non-blocking for audio forwarding
+            conn.settimeout(None)
+            
+            logger.info(f"[{role}] Starting audio loop...")
+            # Handle audio and heartbeat messages
+            handle_audio_loop(client_info)
+            
+        elif msg_type == MSG_TYPE_ADMIN_JOIN:
+            # Same as JOIN but for admin
+            offset = 1
+            name_len = struct.unpack('!I', data[offset:offset+4])[0]
+            offset += 4
+            
+            if name_len == 0 or name_len > 128:
+                logger.warning(f"Invalid admin name length: {name_len}")
+                return
+            
+            while len(data) < offset + name_len:
+                chunk = conn.recv(MAX_PACKET_SIZE)
+                if not chunk:
+                    return
+                data += chunk
+            
+            name = data[offset:offset+name_len].decode('utf-8')
+            offset += name_len
+            
+            password_len = struct.unpack('!I', data[offset:offset+4])[0]
+            offset += 4
+            
+            if password_len == 0 or password_len > 256:
+                logger.warning(f"Invalid password length: {password_len}")
+                return
+            
+            while len(data) < offset + password_len:
+                chunk = conn.recv(MAX_PACKET_SIZE)
+                if not chunk:
+                    return
+                data += chunk
+            
+            password = data[offset:offset+password_len].decode('utf-8')
+            
+            if password != SERVER_PASSWORD:
+                logger.warning(f"Admin [{name}] authentication failed from {addr}")
+                fail_packet = struct.pack('!B', MSG_TYPE_AUTH_FAIL)
+                conn.sendall(fail_packet)
+                return
+            
+            session_key = get_random_bytes(32)
+            
+            salt = hashlib.sha256(password.encode('utf-8')).digest()
+            derived_key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
+            nonce = get_random_bytes(12)
+            cipher = AES.new(derived_key, AES.MODE_GCM, nonce=nonce)
+            encrypted_session_key, tag = cipher.encrypt_and_digest(session_key)
+            
+            response = struct.pack('!B', MSG_TYPE_AUTH_SUCCESS) + nonce + tag + encrypted_session_key
+            conn.sendall(response)
+            
+            client_info = ClientInfo(conn, name, session_key, is_admin=True)
+            
+            with global_lock:
+                admins.append(client_info)
+                logger.info(f"Admin [{name}] joined and authenticated (total: {len(admins)})")
+            
+            # Broadcast outside of lock to avoid deadlock
+            broadcast_user_list()
+            
+            conn.settimeout(None)
+            handle_audio_loop(client_info)
+        
+    except socket.timeout:
+        logger.warning(f"{role.capitalize()} connection timed out during handshake")
+    except Exception as e:
+        import traceback
+        logger.error(f"Error handling {role} connection: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+    finally:
+        # Remove client from list
+        removed_name = None
+        with global_lock:
+            target_list = admins if is_admin else clients
+            for i, c in enumerate(target_list):
+                if c.conn == conn:
+                    removed_name = c.name
+                    target_list.pop(i)
+                    logger.info(f"{role.capitalize()} [{c.name}] disconnected (total: {len(target_list)})")
+                    break
+        # Broadcast outside of lock to avoid deadlock
+        if not is_admin and removed_name:
+            try:
+                broadcast_user_event(MSG_TYPE_USER_JOINED, removed_name)
+                broadcast_user_list()
+            except Exception as e:
+                logger.error(f"Error broadcasting disconnect event: {e}")
+        conn.close()
 
 
-def handle_admin_signal():
-    """Handle admin signaling: ADMIN_JOIN, HEARTBEAT, LEAVE messages."""
-    global sock_admin_signal
-    sock_admin_signal = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock_admin_signal.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock_admin_signal.bind((HOST, ADMIN_SIGNAL_PORT))
-    logger.info(f"Admin signal server started, listening on {HOST}:{ADMIN_SIGNAL_PORT}")
+def handle_audio_loop(client_info):
+    """Main loop for receiving and forwarding audio packets."""
+    is_admin = client_info.is_admin
+    role = "admin" if is_admin else "client"
     
     while True:
         try:
-            data, addr = sock_admin_signal.recvfrom(MAX_PACKET_SIZE)
+            # Read message header (at least 2 bytes: msg_type + data)
+            header = client_info.conn.recv(1)
+            if not header:
+                logger.info(f"{role.capitalize()} [{client_info.name}] connection closed")
+                break
             
-            if len(data) < 2:
+            # Update last activity time (TCP connection is alive)
+            client_info.last_heartbeat = time.time()
+            
+            msg_type = struct.unpack('!B', header)[0]
+            
+            if msg_type == MSG_TYPE_HEARTBEAT:
                 continue
-
-            msg_type = struct.unpack('!B', data[:1])[0]
             
-            if msg_type == MSG_TYPE_ADMIN_JOIN:
-                try:
-                    # Parse ADMIN_JOIN packet: [msg_type(1)][name_len(4)][name][password_len(4)][password][audio_port(2)]
-                    offset = 1
-                    name_len = struct.unpack('!I', data[offset:offset+4])[0]
-                    offset += 4
-                    
-                    if name_len == 0 or name_len > 128:
-                        logger.warning(f"Invalid admin name length: {name_len}")
-                        continue
-                    
-                    name = data[offset:offset+name_len].decode('utf-8')
-                    offset += name_len
-                    
-                    # Extract password
-                    password_len = struct.unpack('!I', data[offset:offset+4])[0]
-                    offset += 4
-                    
-                    if password_len == 0 or password_len > 256:
-                        logger.warning(f"Invalid password length: {password_len}")
-                        continue
-                    
-                    password = data[offset:offset+password_len].decode('utf-8')
-                    offset += password_len
-                    
-                    # Verify password
-                    if password != SERVER_PASSWORD:
-                        logger.warning(f"Admin [{name}] authentication failed from {addr}")
-                        # Send auth failure response
-                        fail_packet = struct.pack('!B', MSG_TYPE_AUTH_FAIL)
-                        sock_admin_signal.sendto(fail_packet, addr)
-                        continue
-                    
-                    # Generate session key for this admin
-                    session_key = get_random_bytes(32)
-                    
-                    # Extract audio port
-                    has_audio_port = len(data) >= offset + 2
-                    admin_audio_port = None
-                    if has_audio_port:
-                        admin_audio_port = struct.unpack('!H', data[offset:offset+2])[0]
-                    
-                    admin_addr = (addr[0], admin_audio_port) if admin_audio_port else addr
-                    
-                    with clients_lock:
-                        admins[admin_addr] = {
-                            'name': name, 
-                            'last_heartbeat': time.time(),
-                            'session_key': session_key
-                        }
-                    
-                    logger.info(f"Admin [{name}] joined and authenticated (total: {len(admins)}), audio addr: {admin_addr}")
-                    
-                    # Send auth success with encrypted session key
-                    salt = hashlib.sha256(password.encode('utf-8')).digest()
-                    derived_key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
-                    nonce = get_random_bytes(12)
-                    cipher = AES.new(derived_key, AES.MODE_GCM, nonce=nonce)
-                    encrypted_session_key, tag = cipher.encrypt_and_digest(session_key)
-                    
-                    response = struct.pack('!B', MSG_TYPE_AUTH_SUCCESS) + nonce + tag + encrypted_session_key
-                    sock_admin_signal.sendto(response, addr)
-                    
-                    broadcast_user_list()
-                except Exception as e:
-                    logger.error(f"Error handling admin join: {e}")
-            
-            elif msg_type == MSG_TYPE_HEARTBEAT:
-                try:
-                    name_len = struct.unpack('!I', data[1:5])[0]
-                    if name_len == 0 or name_len > 128:
-                        continue
-                    
-                    name = data[5:5+name_len].decode('utf-8')
-                    has_audio_port = len(data) >= 5 + name_len + 2
-                    admin_audio_port = None
-                    if has_audio_port:
-                        admin_audio_port = struct.unpack('!H', data[5+name_len:7+name_len])[0]
-                    
-                    admin_addr = (addr[0], admin_audio_port) if admin_audio_port else addr
-                    
-                    with clients_lock:
-                        if admin_addr in admins:
-                            admins[admin_addr]['last_heartbeat'] = time.time()
-                        else:
-                            admins[admin_addr] = {'name': name, 'last_heartbeat': time.time()}
-                            logger.info(f"Admin [{name}] reconnected")
-                except Exception:
-                    pass
-            
-            elif msg_type == MSG_TYPE_LEAVE:
-                try:
-                    name_len = struct.unpack('!I', data[1:5])[0]
-                    if name_len == 0 or name_len > 128:
-                        continue
-                    
-                    name = data[5:5+name_len].decode('utf-8')
-                    has_audio_port = len(data) >= 5 + name_len + 2
-                    admin_audio_port = None
-                    if has_audio_port:
-                        admin_audio_port = struct.unpack('!H', data[5+name_len:7+name_len])[0]
-                    
-                    admin_addr = (addr[0], admin_audio_port) if admin_audio_port else addr
-                    
-                    with clients_lock:
-                        if admin_addr in admins:
-                            del admins[admin_addr]
-                            logger.info(f"Admin [{name}] left (total: {len(admins)})")
-                            broadcast_user_list()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-
-def handle_audio_socket(sock_obj, is_admin=False):
-    """Handle incoming audio packets and broadcast them."""
-    while True:
-        try:
-            data, addr = sock_obj.recvfrom(MAX_PACKET_SIZE)
-            
-            if len(data) < 2:
-                continue
-
-            msg_type = struct.unpack('!B', data[:1])[0]
+            if msg_type == MSG_TYPE_LEAVE:
+                logger.info(f"{role.capitalize()} [{client_info.name}] sent LEAVE")
+                break
             
             if msg_type == MSG_TYPE_AUDIO:
-                broadcast_audio(data, addr)
-        except Exception:
-            pass
+                # Read audio data with timestamp
+                # Format: [timestamp(8)][encrypted_len(4)][encrypted_audio]
+                timestamp_data = b''
+                while len(timestamp_data) < 8:
+                    chunk = client_info.conn.recv(8 - len(timestamp_data))
+                    if not chunk:
+                        break
+                    timestamp_data += chunk
+                
+                if len(timestamp_data) < 8:
+                    break
+                
+                timestamp = struct.unpack('!d', timestamp_data)[0]
+                current_time = time.time()
+                
+                # Check if packet is too old (timeout)
+                packet_age_ms = (current_time - timestamp) * 1000
+                if packet_age_ms > AUDIO_PACKET_TIMEOUT_MS:
+                    logger.debug(f"Dropping old audio packet from {client_info.name} (age: {packet_age_ms:.0f}ms)")
+                    continue
+                
+                # Read encrypted audio data
+                audio_data = b''
+                while len(audio_data) < 4:
+                    chunk = client_info.conn.recv(4 - len(audio_data))
+                    if not chunk:
+                        break
+                    audio_data += chunk
+                
+                if len(audio_data) < 4:
+                    break
+                
+                audio_len = struct.unpack('!I', audio_data)[0]
+                
+                encrypted_audio = b''
+                while len(encrypted_audio) < audio_len:
+                    chunk = client_info.conn.recv(min(audio_len - len(encrypted_audio), MAX_PACKET_SIZE))
+                    if not chunk:
+                        break
+                    encrypted_audio += chunk
+                
+                if len(encrypted_audio) < audio_len:
+                    break
+                
+                # Decrypt and re-encrypt for each recipient
+                decrypted_audio = server_decrypt_with_key(encrypted_audio, client_info.session_key)
+                if decrypted_audio is None:
+                    logger.warning(f"Decryption failed for audio from {client_info.name}")
+                    continue
+                
+                # Forward to all clients except sender
+                with global_lock:
+                    all_clients = list(clients)
+                    all_admins = list(admins)
+                
+                for recipient in all_clients:
+                    if recipient is client_info:
+                        continue
+                    try:
+                        re_encrypted = server_encrypt_with_key(decrypted_audio, recipient.session_key)
+                        re_packet = struct.pack('!B', MSG_TYPE_AUDIO) + struct.pack('!d', current_time) + struct.pack('!I', len(re_encrypted)) + re_encrypted
+                        recipient.conn.sendall(re_packet)
+                    except Exception:
+                        pass
+                
+                # Forward to all admins
+                for admin in all_admins:
+                    try:
+                        re_encrypted = server_encrypt_with_key(decrypted_audio, admin.session_key)
+                        re_packet = struct.pack('!B', MSG_TYPE_AUDIO) + struct.pack('!d', current_time) + struct.pack('!I', len(re_encrypted)) + re_encrypted
+                        admin.conn.sendall(re_packet)
+                        # Update admin's last activity time since they only receive audio
+                        admin.last_heartbeat = current_time
+                    except Exception:
+                        pass
+        
+        except socket.timeout:
+            # Check activity timeout
+            if time.time() - client_info.last_heartbeat > HEARTBEAT_TIMEOUT:
+                logger.info(f"{role.capitalize()} [{client_info.name}] connection timeout")
+                break
+            continue
+        except Exception as e:
+            logger.error(f"Audio socket error for {client_info.name}: {e}")
+            break
 
 
 def check_heartbeats():
-    """Periodically check for timed-out clients and admins, remove them."""
+    """Periodically check for timed-out clients and admins."""
     while True:
         time.sleep(3)
         
-        timed_out_clients = []
-        with clients_lock:
-            for addr, info in list(clients.items()):
-                if time.time() - info['last_heartbeat'] > HEARTBEAT_TIMEOUT:
-                    timed_out_clients.append((addr, info['name']))
-                    del clients[addr]
-        
-        for addr, name in timed_out_clients:
-            logger.info(f"User [{name}] heartbeat timeout, removed (total: {len(clients)})")
-            broadcast_user_event(MSG_TYPE_USER_JOINED, name)
-            broadcast_user_list()
-        
-        timed_out_admins = []
-        with clients_lock:
-            for addr, info in list(admins.items()):
-                if time.time() - info['last_heartbeat'] > HEARTBEAT_TIMEOUT:
-                    timed_out_admins.append((addr, info['name']))
-                    del admins[addr]
-        
-        for addr, name in timed_out_admins:
-            logger.info(f"Admin [{name}] heartbeat timeout, removed (total: {len(admins)})")
-            broadcast_user_list()
+        with global_lock:
+            timed_out = []
+            for c in clients:
+                if time.time() - c.last_heartbeat > HEARTBEAT_TIMEOUT:
+                    timed_out.append(('client', c))
+            for a in admins:
+                if time.time() - a.last_heartbeat > HEARTBEAT_TIMEOUT:
+                    timed_out.append(('admin', a))
+            
+            for role, c in timed_out:
+                if role == 'client':
+                    clients.remove(c)
+                    logger.info(f"User [{c.name}] heartbeat timeout, removed (total: {len(clients)})")
+                    broadcast_user_event(MSG_TYPE_USER_JOINED, c.name)
+                    broadcast_user_list()
+                else:
+                    admins.remove(c)
+                    logger.info(f"Admin [{c.name}] heartbeat timeout, removed (total: {len(admins)})")
+                    broadcast_user_list()
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+def start_server(port, is_admin=False):
+    """Start TCP server."""
+    role = "admin" if is_admin else "client"
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, port))
+    server.listen(128)
+    logger.info(f"{role.capitalize()} server started on {HOST}:{port}")
     
-    parser = argparse.ArgumentParser(description="OpenVoiceChat Server")
-    parser.add_argument("--host", default=HOST, help="Host to bind")
-    parser.add_argument("--port", type=int, default=PORT, help="User audio port")
-    parser.add_argument("--admin-port", type=int, default=ADMIN_PORT, help="Admin audio port")
-    parser.add_argument("--signal-port", type=int, default=SIGNAL_PORT, help="User signal port")
-    parser.add_argument("--admin-signal-port", type=int, default=ADMIN_SIGNAL_PORT, help="Admin signal port")
+    while True:
+        conn, addr = server.accept()
+        thread = threading.Thread(target=handle_client, args=(conn, addr, is_admin))
+        thread.daemon = True
+        thread.start()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="OpenVoiceChat Server (TCP)")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
     
-    HOST = args.host
-    PORT = args.port
-    ADMIN_PORT = args.admin_port
-    SIGNAL_PORT = args.signal_port
-    ADMIN_SIGNAL_PORT = args.admin_signal_port
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format='%(asctime)s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
     
-    # Create and bind client audio socket
-    sock_client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock_client.bind((HOST, PORT))
-    sock_client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
-    sock_client.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 512 * 1024)
-    
-    # Create and bind admin audio socket
-    sock_admin = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock_admin.bind((HOST, ADMIN_PORT))
-    sock_admin.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
-    sock_admin.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 512 * 1024)
-    
-    logger.info(f"Signal server started, user on {HOST}:{SIGNAL_PORT}, admin on {HOST}:{ADMIN_SIGNAL_PORT}")
-    logger.info(f"Audio server started, user on {HOST}:{PORT}, admin on {HOST}:{ADMIN_PORT}")
     logger.info("Session-based authentication enabled")
     
-    # Start all server threads
-    t_user_signal = threading.Thread(target=handle_user_signal, daemon=True)
-    t_user_signal.start()
+    # Start heartbeat checker
+    heartbeat_thread = threading.Thread(target=check_heartbeats)
+    heartbeat_thread.daemon = True
+    heartbeat_thread.start()
     
-    t_admin_signal = threading.Thread(target=handle_admin_signal, daemon=True)
-    t_admin_signal.start()
+    # Start client server
+    client_thread = threading.Thread(target=start_server, args=(CLIENT_PORT, False))
+    client_thread.daemon = True
+    client_thread.start()
     
-    t_audio_user = threading.Thread(target=handle_audio_socket, args=(sock_client, False), daemon=True)
-    t_audio_user.start()
+    # Start admin server
+    admin_thread = threading.Thread(target=start_server, args=(ADMIN_PORT, True))
+    admin_thread.daemon = True
+    admin_thread.start()
     
-    t_audio_admin = threading.Thread(target=handle_audio_socket, args=(sock_admin, True), daemon=True)
-    t_audio_admin.start()
+    logger.info(f"Client server listening on {HOST}:{CLIENT_PORT}")
+    logger.info(f"Admin server listening on {HOST}:{ADMIN_PORT}")
     
-    t_heartbeat = threading.Thread(target=check_heartbeats, daemon=True)
-    t_heartbeat.start()
-    
-    # Keep main thread alive
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        logger.info("Server shutting down...")
-        sock_client.close()
-        sock_admin.close()
+        logger.info("Server shutting down")
+
+
+if __name__ == "__main__":
+    main()

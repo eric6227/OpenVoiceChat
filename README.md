@@ -1,6 +1,6 @@
 # OpenVoiceChat
 
-一个基于UDP的实时语音聊天系统，支持客户端-服务器-管理员架构，采用AES-256-GCM加密保障通信安全。
+一个基于TCP的实时语音聊天系统，支持客户端-服务器-管理员架构，采用AES-256-GCM加密保障通信安全。
 
 ## 项目概述
 
@@ -14,31 +14,34 @@ OpenVoiceChat 是一个轻量级的语音聊天解决方案，包含三个核心
 
 - 实时语音通信
 - AES-256-GCM 加密传输
-- 用户认证系统
-- 心跳检测机制
+- 用户认证系统（连接时验证，生成会话密钥）
+- 音频包超时丢弃机制（防止延迟累积）
 - 图形化界面 (GUI)
 - 支持打包为独立可执行文件
 - Docker 容器化部署支持
 
 ## 系统架构
 
-```
-┌─────────────┐         ┌─────────────┐         ┌─────────────┐
-│   Client    │◄───────►│   Server    │◄───────►│    Admin    │
-│  (GUI App)  │  UDP    │  (Backend)  │  UDP    │  (GUI App)  │
-└─────────────┘         └─────────────┘         └─────────────┘
-     Port: 9090               Port: 9090              Port: 9091
-     Port: 9092               Port: 9092              Port: 9093
+```mermaid
+graph LR
+    Client["👤 Client<br/>(GUI App)"] <-->|"TCP<br/>Port: 9090"| Server["🖧 Server<br/>(Backend)"]
+    Server <-->|"TCP<br/>Port: 9091"| Admin["👨‍💼 Admin<br/>(GUI App)"]
+
+    classDef clientClass fill:#e1f5fe,stroke:#01579b,stroke-width:2px
+    classDef serverClass fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef adminClass fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+    
+    class Client clientClass
+    class Server serverClass
+    class Admin adminClass
 ```
 
 ### 端口说明
 
 | 端口 | 协议 | 用途 |
 |------|------|------|
-| 9090 | UDP | 客户端音频数据传输 |
-| 9091 | UDP | 管理员音频数据传输 |
-| 9092 | UDP | 客户端信令控制 |
-| 9093 | UDP | 管理员信令控制 |
+| 9090 | TCP | 客户端连接（认证+音频数据） |
+| 9091 | TCP | 管理员连接（认证+音频数据） |
 
 ## 技术栈
 
@@ -55,18 +58,62 @@ OpenVoiceChat 是一个轻量级的语音聊天解决方案，包含三个核心
 
 - Python 3.11 或更高版本（运行源码时需要）
 - 麦克风设备
-- 公网服务器（服务器端）
+- 公网服务器
 
 ### 服务器端安装（推荐 Docker）
 
-```bash
-docker build -t openvoicechat-server server/
-docker run -p 9090:9090/udp -p 9091:9091/udp -p 9092:9092/udp -p 9093:9093/udp openvoicechat-server
+**方式一：使用 docker-compose（推荐）**
+
+1. 确保已安装 Docker 和 docker-compose
+
+2. 在项目根目录创建 `docker-compose.yml` 文件，内容如下：
+
+```yaml
+version: '3.8'
+
+services:
+  openvoicechat-server:
+    image: ghcr.io/eric6227/openvoicechat:latest
+    container_name: openvoicechat-server
+    environment:
+      - OVC_PASSWORD=your_password_here
+    ports:
+      - "9090:9090/tcp"
+      - "9091:9091/tcp"
+    restart: unless-stopped
 ```
+
+> 注意：请将 `your_password_here` 替换为你的实际密码。
+
+3. 启动服务：
+
+```bash
+docker-compose up -d
+```
+
+4. 查看日志确认服务启动：
+
+```bash
+docker-compose logs -f
+```
+
+5. 停止服务：
+
+```bash
+docker-compose down
+```
+
+**方式二：使用 docker 命令**
+
+```bash
+docker run -d --name openvoicechat-server -e OVC_PASSWORD=your_password_here -p 9090:9090/tcp -p 9091:9091/tcp ghcr.io/eric6227/openvoicechat:latest
+```
+
+> 注意：请将 `your_password_here` 替换为你的实际密码。
 
 ### 客户端安装（Windows 推荐 exe）
 
-直接运行 `dist/` 目录下的可执行文件：
+直接运行 release 界面的安装包：
 
 - **客户端**: 在 release 界面下载并运行 Client 的安装包
 - **管理员**: 在 release 界面下载并运行 Admin 的安装包
@@ -151,19 +198,53 @@ pyinstaller VoiceChatAdmin.spec
 
 ## 项目结构
 
-```
-OpenVoiceChat/
-├── server/
-│   ├── main.py              # 服务器主程序
-│   ├── requirements.txt     # 服务器依赖
-│   └── Dockerfile           # Docker 配置
-├── client/
-│   ├── main.py              # 客户端主程序
-│   ├── config.yaml          # 客户端配置
-│   └── requirements.txt     # 客户端依赖
-└── admin/
-    ├── main.py              # 管理员主程序
-    └── config_admin.yaml    # 管理员配置
+```mermaid
+graph TD
+    Root["📁 OpenVoiceChat/"]
+
+    subgraph Server["🖧 server/"]
+        S_Main["📄 main.py<br/>服务器主程序"]
+        S_Req["📋 requirements.txt<br/>服务器依赖"]
+        S_Docker["🐳 Dockerfile<br/>Docker 配置"]
+    end
+
+    subgraph Client["👤 client/"]
+        C_Main["📄 main.py<br/>客户端主程序"]
+        C_Config["⚙️ config.yaml<br/>客户端配置"]
+        C_Req["📋 requirements.txt<br/>客户端依赖"]
+    end
+
+    subgraph Admin["👨‍💼 admin/"]
+        A_Main["📄 main.py<br/>管理员主程序"]
+        A_Config["⚙️ config_admin.yaml<br/>管理员配置"]
+    end
+
+    Root --> Server
+    Root --> Client
+    Root --> Admin
+
+    Server --> S_Main
+    Server --> S_Req
+    Server --> S_Docker
+
+    Client --> C_Main
+    Client --> C_Config
+    Client --> C_Req
+
+    Admin --> A_Main
+    Admin --> A_Config
+
+    classDef rootClass fill:#e3f2fd,stroke:#0d47a1,stroke-width:3px
+    classDef serverClass fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef clientClass fill:#e1f5fe,stroke:#01579b,stroke-width:2px
+    classDef adminClass fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+    classDef fileClass fill:#fafafa,stroke:#757575,stroke-width:1px
+
+    class Root rootClass
+    class Server serverClass
+    class Client clientClass
+    class Admin adminClass
+    class S_Main,S_Req,S_Docker,C_Main,C_Config,C_Req,A_Main,A_Config fileClass
 ```
 
 ## 常见问题
