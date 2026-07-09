@@ -1,252 +1,189 @@
 # OpenVoiceChat
 
-一个基于 UDP 的局域网语音聊天系统，支持客户端语音通话和管理员监听功能。
+一个基于UDP的实时语音聊天系统，支持客户端-服务器-管理员架构，采用AES-256-GCM加密保障通信安全。
+
+## 项目概述
+
+OpenVoiceChat 是一个轻量级的语音聊天解决方案，包含三个核心组件：
+
+- **服务器 (Server)**: 负责音频数据转发和用户管理
+- **客户端 (Client)**: 普通用户语音聊天界面
+- **管理员 (Admin)**: 管理员监控和管理界面
 
 ## 功能特性
 
-- **实时语音通话**：基于 UDP 协议的低延迟语音传输
-- **AES-256-GCM 加密**：所有音频数据使用 AES-256-GCM 加密传输
-- **zlib 压缩**：音频数据压缩，减少带宽占用
-- **多用户支持**：支持多个客户端同时在线
-- **管理员监听**：管理员可以监听所有用户的语音
-- **音量调节**：管理员可实时调节监听音量
-- **收听音量**：客户端可调节接收到的音频音量（0.0 - 2.0）
-- **麦克风增益**：客户端可调节发送的麦克风增益（0.0 - 2.0）
-- **本地监听**：客户端可实时监听自己的声音（独立线程，不受静音影响）
-- **密码保护**：使用固定密码进行音频加密/解密
-- **配置记忆**：自动保存服务器地址、用户名、密码、音量、增益等配置
-- **DPAPI 密码加密**：使用 Windows DPAPI 安全保存密码
+- 实时语音通信
+- AES-256-GCM 加密传输
+- 用户认证系统
+- 心跳检测机制
+- 图形化界面 (GUI)
+- 支持打包为独立可执行文件
+- Docker 容器化部署支持
 
 ## 系统架构
 
 ```
-┌─────────────┐     UDP      ┌─────────────┐     UDP      ┌─────────────┐
-│   Client    │ ◄─────────►  │   Server    │ ◄─────────►  │   Client    │
-│  (9090)     │              │  (9090)     │              │  (9090)     │
-└─────────────┘              └─────────────┘              └─────────────┘
-                                    ▲
-                                    │ UDP
-                                    │ (9091)
-                              ┌─────────────┐
-                              │    Admin    │
-                              │  (监听模式)  │
-                              └─────────────┘
+┌─────────────┐         ┌─────────────┐         ┌─────────────┐
+│   Client    │◄───────►│   Server    │◄───────►│    Admin    │
+│  (GUI App)  │  UDP    │  (Backend)  │  UDP    │  (GUI App)  │
+└─────────────┘         └─────────────┘         └─────────────┘
+     Port: 9090               Port: 9090              Port: 9091
+     Port: 9092               Port: 9092              Port: 9093
 ```
 
-## 安装方式
+### 端口说明
 
-### Windows（推荐）
+| 端口 | 协议 | 用途 |
+|------|------|------|
+| 9090 | UDP | 客户端音频数据传输 |
+| 9091 | UDP | 管理员音频数据传输 |
+| 9092 | UDP | 客户端信令控制 |
+| 9093 | UDP | 管理员信令控制 |
 
-直接下载并运行提供的安装包（`.exe` 文件）：
+## 技术栈
 
-- `VoiceChatClient.exe` - 客户端程序
-- `VoiceChatAdmin.exe` - 管理员程序
+- **Python 3.11+**
+- **PyAudio**: 音频采集和播放
+- **PyCryptodome**: AES-256-GCM 加密
+- **Tkinter**: 图形用户界面
+- **PyInstaller**: 可执行文件打包
+- **Docker**: 服务器容器化
 
-### 其他平台（Linux / macOS）
+## 快速开始
 
-#### 1. 安装依赖
+### 前置要求
+
+- Python 3.11 或更高版本（运行源码时需要）
+- 麦克风设备
+- 公网服务器（服务器端）
+
+### 服务器端安装（推荐 Docker）
 
 ```bash
-# 客户端和管理员
-pip install pyaudio pycryptodome psutil pyyaml
-
-# 服务器
-pip install pycryptodome psutil pyyaml
+docker build -t openvoicechat-server server/
+docker run -p 9090:9090/udp -p 9091:9091/udp -p 9092:9092/udp -p 9093:9093/udp openvoicechat-server
 ```
 
-**注意**：Linux 系统可能需要额外安装 PortAudio：
+### 客户端安装（Windows 推荐 exe）
+
+直接运行 `dist/` 目录下的可执行文件：
+
+- **客户端**: 在 release 界面下载并运行 Client 的安装包
+- **管理员**: 在 release 界面下载并运行 Admin 的安装包
+
+> 注意：首次运行可能需要允许Windows防火墙访问网络。
+
+### 客户端安装（其它平台运行源码）
+
 ```bash
-# Ubuntu/Debian
-sudo apt-get install portaudio19-dev python3-pyaudio
-
-# macOS
-brew install portaudio
-pip install pyaudio
-```
-
-#### 2. 运行程序
-
-```bash
-# 启动服务器
-python server/main.py
+# 安装依赖
+cd client
+pip install -r requirements.txt
 
 # 启动客户端
-python client/main.py
-
-# 启动管理员
-python admin/main.py
+python main.py
 ```
 
-### 自行编译（可选）
-
-#### 安装 PyInstaller
+### 管理端安装（其它平台运行源码）
 
 ```bash
-pip install pyinstaller
+# 安装依赖
+cd admin
+pip install -r requirements.txt
+
+# 启动管理员界面
+python main.py
 ```
 
-#### 编译客户端
+### 其它安装方式
+
+<details>
+<summary>服务器端 - 从源码运行</summary>
 
 ```bash
-pyinstaller --onefile --windowed --name=VoiceChatClient client/main.py
+cd server
+pip install -r requirements.txt
+python main.py
 ```
 
-#### 编译管理员
+</details>
+
+<details>
+<summary>客户端/管理端 - 从源码运行（Windows）</summary>
 
 ```bash
-pyinstaller --onefile --windowed --name=VoiceChatAdmin admin/main.py
+# 启动客户端
+cd client
+pip install -r requirements.txt
+python main.py
+
+# 启动管理员界面
+cd admin
+pip install -r requirements.txt
+python main.py
 ```
 
-#### 编译服务器
+</details>
+
+<details>
+<summary>打包为可执行文件</summary>
+
+使用 PyInstaller 打包应用程序：
 
 ```bash
-pyinstaller --onefile --name=VoiceChatServer server/main.py
+# 打包客户端
+pyinstaller VoiceChatClient.spec
+
+# 打包管理员
+pyinstaller VoiceChatAdmin.spec
 ```
 
-编译后的可执行文件位于 `dist/` 目录下。
+打包后的可执行文件位于 `dist/` 目录。
 
-## 使用方法
+</details>
 
-### 服务器
+## 安全说明
 
-1. 运行 `server/main.py` 或 `VoiceChatServer.exe`
-2. 服务器默认监听以下四个端口（**必须全部开放**）：
-   - **9090**：客户端音频数据端口
-   - **9091**：管理员音频数据端口
-   - **9092**：客户端信号端口
-   - **9093**：管理员信号端口
-3. 服务器默认密码 `OpenVoiceChat2026!` 进行音频加密/解密
-> 请务必修改密码为强密码，建议至少24位字母、数字和特殊字符组合
-
-### 客户端
-
-1. 运行 `client/main.py` 或 `VoiceChatClient.exe`
-2. 输入服务器地址、端口、昵称和密码
-3. 点击"连接"按钮加入语音聊天
-4. 可使用"静音"按钮控制是否发送声音
-5. 可使用"监听自己"按钮实时听到自己的声音（独立线程，不受静音影响）
-6. 可调节"收听音量"滑块控制接收到的音频音量
-7. 可调节"麦克风增益"滑块控制发送的麦克风音量
-
-### 管理员
-
-1. 运行 `admin/main.py` 或 `VoiceChatAdmin.exe`
-2. 输入服务器地址、端口、昵称和密码
-3. 点击"连接"按钮进入监听模式
-4. 可查看所有在线用户列表
-5. 可调节监听音量
-
-## 技术细节
-
-### 通信协议
-
-#### 数据包格式
-
-所有数据包使用以下结构：
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| 魔术字 | 4 bytes | `0x564F4950` ("VOIP") |
-| 包类型 | 1 byte | 0=音频, 1=用户列表, 2=用户加入, 3=用户离开 |
-| 用户名长度 | 1 byte | 用户名字节长度 |
-| 用户名 | 变长 | UTF-8 编码的用户名 |
-| 音频数据 | 变长 | zlib 压缩 + AES-256-GCM 加密的音频数据 |
-
-#### 信号通道
-
-- **客户端信号端口 (9090)**：处理客户端连接/断开、音频转发
-- **管理员信号端口 (9091)**：处理管理员连接、用户列表推送
-
-### 音频处理
-
-- **采样率**：44100 Hz
-- **声道**：单声道
-- **采样格式**：16-bit PCM
-- **帧大小**：1024 样本/帧
-- **压缩**：zlib 压缩
-- **加密**：AES-256-GCM
-- **音量调节**：客户端可调节收听音量（0.0-2.0）和麦克风增益（0.0-2.0）
-
-### 加密机制
-
-1. 服务器默认密码 `OpenVoiceChat2026!` 派生 AES-256 密钥
-2. 客户端发送音频前使用密码加密
-3. 服务器收到后解密，再用服务器密码重新加密后广播
-4. 其他客户端收到后用密码解密播放
-
-### 配置存储
-
-- 客户端配置：`client/config.yaml`
-- 管理员配置：`admin/config_admin.yaml`
-- 密码使用 Windows DPAPI 加密存储（仅 Windows）
-
-### 线程模型
-
-- **主线程**：GUI 事件循环
-- **音频发送线程**：从麦克风采集音频并发送
-- **音频接收线程**：接收并播放远程音频
-- **本地监听线程**：独立采集播放本地音频（不受静音影响）
-- **信号接收线程**：处理服务器信号（用户列表、事件通知）
+- 所有音频数据使用 AES-256-GCM 加密传输
+- 密码使用 PBKDF2-HMAC-SHA256 派生密钥（100,000 次迭代）
+- Windows 平台支持 DPAPI 加密存储密码
+- 心跳检测防止未授权连接
 
 ## 项目结构
 
 ```
 OpenVoiceChat/
 ├── server/
-│   ├── main.py          # 服务器主程序
-│   └── requirements.txt # 服务器依赖
+│   ├── main.py              # 服务器主程序
+│   ├── requirements.txt     # 服务器依赖
+│   └── Dockerfile           # Docker 配置
 ├── client/
-│   ├── main.py          # 客户端主程序
-│   ├── config.yaml      # 客户端配置（自动生成）
-│   └── requirements.txt # 客户端依赖
-├── admin/
-│   ├── main.py          # 管理员主程序
-│   └── config_admin.yaml # 管理员配置（自动生成）
-├── dist/                # 编译输出目录
-├── .gitignore           # Git 忽略规则
-└── README.md            # 项目说明
+│   ├── main.py              # 客户端主程序
+│   ├── config.yaml          # 客户端配置
+│   └── requirements.txt     # 客户端依赖
+└── admin/
+    ├── main.py              # 管理员主程序
+    └── config_admin.yaml    # 管理员配置
 ```
 
-## 依赖项
+## 常见问题
 
-| 包名 | 用途 |
-|------|------|
-| pyaudio | 音频采集和播放 |
-| pycryptodome | AES-256-GCM 加密/解密 |
-| psutil | 进程管理 |
-| pyyaml | YAML 配置文件读写 |
+### 音频无法正常工作
 
-## 注意事项
+- 检查麦克风权限
+- 确认 PyAudio 已正确安装
+- Linux 用户可能需要安装 PortAudio
 
-1. **防火墙（重要）**：确保服务器以下四个端口全部开放，缺一不可：
-   - **9090**：客户端音频数据端口
-   - **9091**：管理员音频数据端口
-   - **9092**：客户端信号端口
-   - **9093**：管理员信号端口
-2. **网络**：客户端和管理员需要能访问服务器的 IP 地址
-3. **音频设备**：需要有效的麦克风和扬声器设备
-4. **密码安全**：密码用于音频加密，所有用户必须使用相同密码
-5. **DPAPI**：密码记忆功能仅在 Windows 上可用，使用当前用户凭据加密
+### 连接失败
+
+- 确认服务器正在运行
+- 检查防火墙设置
+- 验证配置中的主机地址和端口
+
+## AI声明
+
+本项目使用AI编写，在人类指引下开发，经过人工验证
 
 ## 许可证
 
-[MIT License](./LICENSE)
-
----
-
-## AI 生成声明
-
-本项目代码由 AI 辅助生成。开发过程中使用了人工智能编程助手来编写、调试和优化代码。所有功能实现、架构设计和技术决策均在人类开发者的指导和监督下完成。
-
-AI 在本项目中的贡献包括但不限于：
-- 代码编写和重构
-- Bug 修复和问题排查
-- 功能实现和优化
-- 文档编写（包括这个 AI 声明）
-
-人类开发者负责：
-- 项目架构设计
-- 功能需求定义
-- 代码审查和测试
-- 最终决策和质量把控
-> PS：AI 生成的第一版根本不能用😡
+本项目采用 MIT 许可证。详见 [LICENSE](./LICENSE) 文件。
