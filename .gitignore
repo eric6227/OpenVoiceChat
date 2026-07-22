@@ -220,3 +220,14 @@ __marimo__/
 # OpenVoiceChat
 client/config.yaml
 admin/config_admin.yaml
+client/known_servers.json
+admin/known_servers_admin.json
+server/server_rsa_key.pem
+server/device_fingerprints.json
+server/recordings/
+server/ban_list.json
+client_icon.png
+admin_icon.png
+version_client.txt
+version_admin.txt
+编译命令.md
