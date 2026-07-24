@@ -6,13 +6,12 @@ import logging
 import time
 import os
 import hashlib
-import getpass
-import argparse
 import yaml
 import ctypes
 import ctypes.wintypes
 import json
 import array
+import queue
 
 # Ensure the project root is in sys.path so shared module can be imported
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,29 +30,30 @@ except ImportError:
     print("错误: 请先安装 pycryptodome: pip install pycryptodome")
     sys.exit(1)
 
-try:
-    import tkinter as tk
-    from tkinter import ttk, messagebox, scrolledtext
-    HAS_GUI = True
-except ImportError:
-    HAS_GUI = False
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
 
 from shared import (
     get_device_fingerprint,
     AudioEncryptor, SessionKeyEncryptor,
-    AudioCompressor, JitterBuffer, AudioPlayer,
+    AudioCompressor, JitterBuffer, AudioPlayer, NoiseSuppressor,
     CHANNELS, RATE, CHUNK,
     MSG_TYPE_JOIN, MSG_TYPE_AUDIO,
     MSG_TYPE_USER_LIST, MSG_TYPE_USER_JOINED, MSG_TYPE_HEARTBEAT,
     MSG_TYPE_LEAVE, MSG_TYPE_AUTH_SUCCESS, MSG_TYPE_AUTH_FAIL,
     MSG_TYPE_BANNED, MSG_TYPE_ADMIN_NOT_ONLINE,
     MSG_TYPE_RECORDING_NOTICE, MSG_TYPE_RECORDING_CONSENT,
+    MSG_TYPE_ADMIN_ONLINE, MSG_TYPE_ADMIN_OFFLINE,
+    MSG_TYPE_DUPLICATE_NAME,
+    MSG_TYPE_TEXT_CHAT, MSG_TYPE_TEXT_MESSAGE,
+    MSG_TYPE_UDP_PORT, UDP_AUDIO_PORT,
     JITTER_BUFFER_SIZE, MAX_PACKET_SIZE,
     init_audio_format,
     encrypt_password_dpapi, decrypt_password_dpapi,
     load_known_servers, save_known_servers,
     compute_server_fingerprint, verify_server_fingerprint,
 )
+from shared.rudp import RUDPEndpoint, pack_rudp_message, unpack_rudp_message
 
 init_audio_format(pyaudio)
 FORMAT = pyaudio.paInt16
@@ -61,177 +61,18 @@ FORMAT = pyaudio.paInt16
 logger = logging.getLogger(__name__)
 
 
-def send_audio(sock, p, listen_own: bool, player: AudioPlayer, encryptor: SessionKeyEncryptor, compressor: AudioCompressor, mute: bool = False, input_device=None, gain: float = 1.0):
-    """Capture microphone audio, apply gain/mute, compress, encrypt, and send to server via TCP."""
-    kwargs = {
-        'format': FORMAT,
-        'channels': CHANNELS,
-        'rate': RATE,
-        'input': True,
-        'frames_per_buffer': CHUNK
-    }
-    if input_device is not None:
-        kwargs['input_device_index'] = input_device
-    stream = p.open(**kwargs)
-    logger.info(f"Microphone opened, sending audio... (muted: {'yes' if mute else 'no'}, gain: {gain:.1f})")
-    
-    packet_count = 0
-    try:
-        while True:
-            data = stream.read(CHUNK, exception_on_overflow=False)
-            try:
-                original_data = data
-                if mute:
-                    samples = array.array('h', data)
-                    samples = array.array('h', [0] * len(samples))
-                    data = samples.tobytes()
-                elif gain != 1.0:
-                    samples = array.array('h', data)
-                    samples = array.array('h', [int(s * gain) for s in samples])
-                    samples = array.array('h', [max(-32768, min(32767, s)) for s in samples])
-                    data = samples.tobytes()
-                compressed_data = compressor.compress(data)
-                encrypted_data = encryptor.encrypt(compressed_data)
-                timestamp = time.time()
-                header = struct.pack('!B', MSG_TYPE_AUDIO) + struct.pack('!d', timestamp) + struct.pack('!I', len(encrypted_data))
-                packet = header + encrypted_data
-                sock.sendall(packet)
-                
-                packet_count += 1
-                if packet_count % 10 == 0:
-                    logger.debug(f"[Send] Sent #{packet_count}, size: {len(packet)} bytes")
-                
-                if listen_own and player:
-                    player.push(original_data)
-            except Exception as e:
-                logger.error(f"Failed to send audio: {e}")
-                break
-    except Exception as e:
-        logger.error(f"Error reading audio data: {e}")
-    finally:
-        stream.stop_stream()
-        stream.close()
-
-
-def send_heartbeat(sock, server_addr, name, encryptor=None):
-    """Continuously send heartbeat packets to keep the connection alive."""
-    heartbeat_interval = 3
-    while True:
-        try:
-            name_bytes = name.encode('utf-8')
-            if encryptor:
-                # Encrypt heartbeat data: [name]
-                encrypted_data = encryptor.encrypt(name_bytes)
-                heartbeat_packet = struct.pack('!B', MSG_TYPE_HEARTBEAT) + struct.pack('!I', len(encrypted_data)) + encrypted_data
-            else:
-                # Fallback to plaintext if no encryptor (pre-authentication)
-                heartbeat_packet = struct.pack('!BI', MSG_TYPE_HEARTBEAT, len(name_bytes)) + name_bytes
-            
-            sock.sendall(heartbeat_packet)
-            time.sleep(heartbeat_interval)
-        except Exception:
-            time.sleep(heartbeat_interval)
-
-
-def receive_audio(sock, player: AudioPlayer, encryptor: SessionKeyEncryptor, compressor: AudioCompressor):
-    """Receive encrypted audio from server via TCP, decrypt, decompress, and play."""
-    logger.info("Starting to receive audio...")
-    packet_count = 0
-    buffer = b''
-    
-    while True:
-        try:
-            data = sock.recv(MAX_PACKET_SIZE)
-            if not data:
-                logger.warning("Server disconnected")
-                break
-            
-            buffer += data
-            
-            while len(buffer) >= 1:
-                msg_type = struct.unpack('!B', buffer[:1])[0]
-                
-                if msg_type == MSG_TYPE_AUDIO:
-                    # Format: [msg_type(1)][timestamp(8)][encrypted_len(4)][encrypted_audio]
-                    if len(buffer) < 13:  # 1 + 8 + 4
-                        break
-                    
-                    timestamp = struct.unpack('!d', buffer[1:9])[0]
-                    encrypted_len = struct.unpack('!I', buffer[9:13])[0]
-                    
-                    if len(buffer) < 13 + encrypted_len:
-                        break
-                    
-                    encrypted_data = buffer[13:13+encrypted_len]
-                    buffer = buffer[13+encrypted_len:]
-                    
-                    packet_count += 1
-                    if packet_count % 10 == 0:
-                        logger.debug(f"Received packet #{packet_count}, size: {len(encrypted_data)} bytes")
-                    
-                    compressed_data = encryptor.decrypt(encrypted_data)
-                    if compressed_data:
-                        pcm_data = compressor.decompress(compressed_data)
-                        if packet_count % 10 == 0:
-                            logger.debug(f"Decryption OK, compressed: {len(compressed_data)} bytes, PCM: {len(pcm_data)} bytes")
-                        player.push(pcm_data)
-                    else:
-                        if packet_count % 10 == 0:
-                            logger.debug("Decryption failed, skipping")
-                elif msg_type == MSG_TYPE_USER_LIST:
-                    # Format: [msg_type(1)][encrypted_len(4)][encrypted_data]
-                    if len(buffer) < 5:
-                        break
-                    encrypted_len = struct.unpack('!I', buffer[1:5])[0]
-                    if len(buffer) < 5 + encrypted_len:
-                        break
-                    encrypted_data = buffer[5:5+encrypted_len]
-                    buffer = buffer[5+encrypted_len:]
-                    decrypted_data = encryptor.decrypt(encrypted_data)
-                    if decrypted_data:
-                        user_list = decrypted_data.decode('utf-8')
-                        print(f"\n[Online Users] {user_list}\n")
-                elif msg_type == MSG_TYPE_USER_JOINED:
-                    # Format: [msg_type(1)][encrypted_len(4)][encrypted_data]
-                    if len(buffer) < 5:
-                        break
-                    encrypted_len = struct.unpack('!I', buffer[1:5])[0]
-                    if len(buffer) < 5 + encrypted_len:
-                        break
-                    encrypted_data = buffer[5:5+encrypted_len]
-                    buffer = buffer[5+encrypted_len:]
-                    decrypted_data = encryptor.decrypt(encrypted_data)
-                    if decrypted_data:
-                        event = decrypted_data.decode('utf-8')
-                        print(f"\n[User Joined] {event}\n")
-                elif msg_type == MSG_TYPE_BANNED:
-                    print("\n您的设备已被管理员封禁，连接将被断开\n")
-                    return
-                elif msg_type == MSG_TYPE_LEAVE:
-                    print("\n管理员已退出，所有用户将被强制断开连接\n")
-                    return
-                else:
-                    buffer = buffer[1:]
-        except ConnectionResetError:
-            logger.warning("Connection reset by server")
-            break
-        except Exception as e:
-            logger.error(f"Error receiving audio: {e}")
-            time.sleep(0.1)
-
-
 class VoiceChatGUI:
     """Main GUI class for the voice chat client."""
-    def __init__(self, root):
+    def __init__(self, root, name_override=None):
         self.root = root
         self.root.title("Open Voice Chat Client")
         self.root.resizable(True, True)
         
-        # Automatically set window size to 1/5 width and 1/2 height of screen
+        # Automatically set window size to 1/5 width and 2/3 height of screen
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
         window_width = screen_width // 5
-        window_height = screen_height // 2
+        window_height = screen_height * 2 // 3
         self.root.geometry(f"{window_width}x{window_height}")
         
         self.connected = False
@@ -239,12 +80,16 @@ class VoiceChatGUI:
         self.mute = False
         self.listen_own = False
         
-        self.sock_audio = None
-        self.sock_signal = None
+        self.sock_audio = None  # Will be replaced by udp_sock
+        self.sock_signal = None  # No longer used
+        self.udp_sock = None  # Single UDP socket for all communication
+        self.rudp_endpoint = None  # RUDP endpoint for reliable control messages
+        self.server_addr = None  # (host, port) of server's UDP port
         self.player = None
         self.p = None
         self.encryptor = None
         self.compressor = None
+        self.noise_suppressor = NoiseSuppressor(threshold=0)  # Noise gate, 0=off
         self.audio_encryptor = None  # Session key based encryptor
         self.session_key = None
         self.server_addr = None
@@ -253,11 +98,19 @@ class VoiceChatGUI:
         self.user_id_map = {}  # Maps user_id -> user_name for display
         self.my_user_id = None  # Own user_id assigned by server
         self.muted_users = set()  # Set of user_ids that are muted
+        self._packet_queue = None  # Queue for decoupling recv from processing
+        self.last_packet_time = 0  # Timestamp of last received packet
+        self._auto_reconnect = True  # Auto-reconnect on server disconnect
+        self._reconnect_params = None  # (host, port, name, password) for reconnection
+        self._admin_online = True  # Whether admin is currently online
+        self._active_audio_users = {}  # user_id -> last_audio_time for volume normalization
+        self._text_allowed = True  # Whether text chat is allowed (gated by _admin_online if REQUIRE_ADMIN)
         
         # Recording notice related
         self.server_recording_enabled = False  # Whether server has recording enabled
         self.server_recording_purpose = ""  # Recording purpose from server
         self.server_recording_storage = 0  # Storage duration in minutes
+        self.server_recording_max_size = 10240  # Max total size in MB
         
         # Threading protection
         self._connect_lock = False  # Prevent multiple simultaneous connections
@@ -284,7 +137,10 @@ class VoiceChatGUI:
         self.known_servers_file = os.path.join(base_dir, 'known_servers.json')
         self._load_config()
         self.known_servers = self._load_known_servers()
-        
+
+        if name_override:
+            self.config['name'] = name_override
+
         self._setup_ui()
         
     def _load_config(self):
@@ -298,7 +154,8 @@ class VoiceChatGUI:
             'listen_own': False,
             'password_encrypted': None,
             'volume': 1.0,
-            'gain': 1.0
+            'gain': 1.0,
+            'noise_threshold': 0
         }
         try:
             if os.path.exists(self.config_file):
@@ -350,7 +207,7 @@ class VoiceChatGUI:
         logger.info(f"First connection to {server_addr}")
         logger.info(f"Server public key fingerprint: {fingerprint}")
         
-        if HAS_GUI and self.root and self.root.winfo_exists():
+        if self.root and self.root.winfo_exists():
             if not self._show_privacy_dialog():
                 logger.warning("User rejected privacy agreement, connection aborted")
                 return False
@@ -363,11 +220,6 @@ class VoiceChatGUI:
             self._save_known_servers()
             logger.info(f"Server fingerprint saved for {server_addr}")
             return True
-        
-        logger.warning("CLI mode: auto-accepting server fingerprint")
-        self.known_servers[server_addr] = fingerprint
-        self._save_known_servers()
-        return True
     
     def _show_privacy_dialog(self) -> bool:
         """Show privacy agreement dialog (must be called from main thread)."""
@@ -417,42 +269,51 @@ class VoiceChatGUI:
         """
         if self.server_recording_enabled:
             # Server has recording enabled, show detailed notice
-            storage_days = self.server_recording_storage
+            storage_minutes = self.server_recording_storage
+            storage_text = f"{storage_minutes} 分钟"
+            if storage_minutes >= 60:
+                storage_text = f"{storage_minutes // 60} 小时 {storage_minutes % 60} 分钟"
+            
+            max_size = self.server_recording_max_size
+            size_text = f"{max_size} MB"
+            if max_size >= 1024:
+                size_text = f"{max_size / 1024:.1f} GB"
             
             consent_message = (
-                f"服务器录音提示\n\n"
+                f"服务器录音与管理提示\n\n"
+                f"管理员监听: 服务器有人类管理员全程监听您的音频通信\n"
+                f"（通常是邀请您加入服务器的人），以确保安全和合规。\n\n"
                 f"服务器状态: 已开启音频录制\n\n"
                 f"录音目的:\n{self.server_recording_purpose}\n\n"
-                f"存储期限:\n{storage_days} 天（超过期限的文件将被自动删除）\n\n"
+                f"存储期限:\n{storage_text}（超过期限的文件将被自动删除）\n\n"
                 f"录音方式:\n"
                 f"- 格式: WAV (PCM 32-bit)\n"
                 f"- 采样率: 16000 Hz\n"
                 f"- 声道: 单声道\n"
                 f"- 存储位置: 服务器本地 recordings/ 目录\n"
-                f"- 文件大小限制: 10 GB（总大小）\n\n"
+                f"- 文件大小限制: {size_text}（总大小）\n\n"
                 f"录音范围:\n"
                 f"- 录制您发送的所有音频数据\n"
                 f"- 解密后的原始音频保存到服务器\n"
                 f"- 按用户分别存储，文件名格式: 用户名_时间戳.wav\n\n"
                 f"{'='*44}\n\n"
-                f"继续连接即表示您同意服务器录制您的音频。\n"
+                f"继续连接即表示您同意服务器录制您的音频及管理员监听。\n"
                 f"如不同意，请点击“否”断开连接。"
             )
             
             result = messagebox.askyesno(
-                "服务器录音提示",
+                "服务器录音与管理提示",
                 consent_message
             )
             
             # Send consent response to server
             try:
-                if self.sock_audio and not self.sock_audio._closed:
-                    consent_packet = struct.pack('!BB', MSG_TYPE_RECORDING_CONSENT, 1 if result else 0)
-                    with self._send_lock:
-                        self.sock_audio.sendall(consent_packet)
+                if self.rudp_endpoint:
+                    consent_data = struct.pack('!B', 1 if result else 0)
+                    self.rudp_endpoint.send_raw(MSG_TYPE_RECORDING_CONSENT, consent_data)
                     self.root.after(0, self._log, f"已发送录音同意响应: {'同意' if result else '拒绝'}")
                 else:
-                    self.root.after(0, self._log, "警告: 音频连接已断开，无法发送同意响应")
+                    self.root.after(0, self._log, "警告: RUDP端点未初始化，无法发送同意响应")
             except Exception as e:
                 self.root.after(0, self._log, f"发送录音同意失败: {e}")
             
@@ -460,7 +321,9 @@ class VoiceChatGUI:
         else:
             # Server has recording disabled, show notice
             notice_message = (
-                f"服务器未开启录音\n\n"
+                f"服务器录音与管理提示\n\n"
+                f"管理员监听: 服务器有人类管理员全程监听您的音频通信\n"
+                f"（通常是邀请您加入服务器的人），以确保安全和合规。\n\n"
                 f"服务器状态: 未开启音频录制\n\n"
                 f"您的语音数据不会被服务器录制保存。\n\n"
                 f"{'='*44}\n\n"
@@ -468,19 +331,18 @@ class VoiceChatGUI:
             )
             
             result = messagebox.askyesno(
-                "服务器录音状态",
+                "服务器录音与管理提示",
                 notice_message
             )
             
             # Send consent response to server (always consent=True when recording disabled)
             try:
-                if self.sock_audio and not self.sock_audio._closed:
-                    consent_packet = struct.pack('!BB', MSG_TYPE_RECORDING_CONSENT, 1)
-                    with self._send_lock:
-                        self.sock_audio.sendall(consent_packet)
+                if self.rudp_endpoint:
+                    consent_data = struct.pack('!B', 1)
+                    self.rudp_endpoint.send_raw(MSG_TYPE_RECORDING_CONSENT, consent_data)
                     self.root.after(0, self._log, "已发送录音同意响应: 同意（服务器未开启录音）")
                 else:
-                    self.root.after(0, self._log, "警告: 音频连接已断开，无法发送同意响应")
+                    self.root.after(0, self._log, "警告: RUDP端点未初始化，无法发送同意响应")
             except Exception as e:
                 self.root.after(0, self._log, f"发送录音同意失败: {e}")
             
@@ -568,6 +430,14 @@ class VoiceChatGUI:
         self.gain_var.trace('w', self._update_gain_label)
         self.gain_var.trace('w', self._apply_gain)
         
+        ttk.Label(config_frame, text="降噪:").grid(row=5, column=0, sticky=tk.W, padx=5, pady=5)
+        self.noise_var = tk.IntVar(value=self.config.get('noise_threshold', 0))
+        ttk.Scale(config_frame, from_=0, to=100, variable=self.noise_var, orient=tk.HORIZONTAL).grid(row=5, column=1, sticky=tk.W+tk.E, padx=5, pady=5)
+        self.noise_label = ttk.Label(config_frame, text=f"{self.config.get('noise_threshold', 0)}%")
+        self.noise_label.grid(row=5, column=2, padx=5, pady=5)
+        self.noise_var.trace('w', self._update_noise_label)
+        self.noise_var.trace('w', self._apply_noise)
+        
         # Status frame
         status_frame = ttk.Frame(main_frame)
         status_frame.pack(fill=tk.X, pady=(0, 10))
@@ -603,11 +473,28 @@ class VoiceChatGUI:
         self.user_volumes = {}  # Volume per user_id: {user_id: volume_value}
         self.user_buttons = {}  # Store button references: {user_id: {"solo": btn, "mute": btn, "volume_scale": scale, "volume_label": label}}
         
-        # Log frame
-        log_frame = ttk.LabelFrame(main_frame, text="日志", padding="10")
-        log_frame.pack(fill=tk.BOTH, expand=True)
+        # Text chat frame
+        chat_frame = ttk.LabelFrame(main_frame, text="文字聊天", padding="10")
+        chat_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=10, state=tk.DISABLED, wrap=tk.WORD)
+        self.chat_text = scrolledtext.ScrolledText(chat_frame, height=8, state=tk.DISABLED, wrap=tk.WORD)
+        self.chat_text.pack(fill=tk.BOTH, expand=True)
+        
+        chat_input_frame = ttk.Frame(chat_frame)
+        chat_input_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        self.chat_input = ttk.Entry(chat_input_frame)
+        self.chat_input.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        self.chat_input.bind("<Return>", self._send_text_message)
+        
+        self.chat_send_btn = ttk.Button(chat_input_frame, text="发送", command=self._send_text_message)
+        self.chat_send_btn.pack(side=tk.RIGHT)
+        
+        # Log frame (reduced height for chat)
+        log_frame = ttk.LabelFrame(main_frame, text="日志", padding="10")
+        log_frame.pack(fill=tk.BOTH, expand=False)
+        
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=2, state=tk.DISABLED, wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True)
         
     def _recv_exact(self, size):
@@ -636,74 +523,113 @@ class VoiceChatGUI:
         self.log_text.config(state=tk.DISABLED)
         
     def _update_users(self, message):
-        """Update the online users list display."""
-        # Clear user_id_map and rebuild
-        self.user_id_map.clear()
-        self.user_buttons.clear()
+        """Update the online users list display incrementally.
         
-        # Clear scroll frame
-        for widget in self.users_scroll_frame.winfo_children():
-            widget.destroy()
-        
-        if message.startswith("Users: "):
-            users_str = message[7:]
-            # Parse format: "[ID:1]user1, [ID:2]user2"
-            users = [u.strip() for u in users_str.split(",") if u.strip()]
-            if users:
-                for user in users:
-                    # Extract user_id and name
-                    if user.startswith("[ID:"):
+        Only adds new users and removes departed users. Users that
+        remain unchanged are not refreshed, preventing UI flicker.
+        """
+        try:
+            new_user_list = json.loads(message)
+            new_ids = set()
+            new_id_to_name = {}
+            
+            # Build new user set (excluding self)
+            for user in new_user_list:
+                user_id = user["id"]
+                new_ids.add(user_id)
+                new_id_to_name[user_id] = user["name"]
+            
+            # Get current user IDs (excluding self from display set)
+            old_ids = set(self.user_id_map.keys())
+            if self.my_user_id is not None:
+                old_ids.discard(self.my_user_id)
+                new_ids.discard(self.my_user_id)
+            
+            # Remove departed users
+            removed_ids = old_ids - new_ids
+            for user_id in removed_ids:
+                if user_id in self.user_buttons:
+                    buttons = self.user_buttons[user_id]
+                    if "row_frame" in buttons:
                         try:
-                            end_bracket = user.index("]")
-                            user_id = int(user[4:end_bracket])
-                            username = user[end_bracket+1:]
-                            self.user_id_map[user_id] = username
-                            
-                            # Skip self from display
-                            if self.my_user_id is not None and user_id == self.my_user_id:
-                                continue
-                            
-                            # Create row frame for this user
-                            row_frame = ttk.Frame(self.users_scroll_frame)
-                            row_frame.pack(fill=tk.X, pady=2, padx=5)
-                            
-                            # Username label
-                            name_label = ttk.Label(row_frame, text=username, width=15, anchor=tk.W)
-                            name_label.pack(side=tk.LEFT, padx=5)
-                            
-                            # Solo button
-                            solo_active = user_id in self.solo_users
-                            solo_bg = "#228B22" if solo_active else "#90EE90"
-                            solo_btn = tk.Button(row_frame, text="S", bg=solo_bg, width=3, height=1,
-                                               command=lambda uid=user_id, uname=username: self._toggle_solo(uid, uname))
-                            solo_btn.pack(side=tk.LEFT, padx=2)
-                            
-                            # Mute button
-                            mute_active = user_id in self.muted_users
-                            mute_bg = "#CC0000" if mute_active else "#FFB6C1"
-                            mute_btn = tk.Button(row_frame, text="M", bg=mute_bg, width=3, height=1,
-                                               command=lambda uid=user_id, uname=username: self._toggle_mute(uid, uname))
-                            mute_btn.pack(side=tk.LEFT, padx=2)
-                            
-                            # Volume slider
-                            user_volume = self.user_volumes.get(user_id, 1.0)
-                            volume_var = tk.DoubleVar(value=user_volume)
-                            volume_scale = ttk.Scale(row_frame, from_=0.0, to=2.0, variable=volume_var, orient=tk.HORIZONTAL)
-                            volume_scale.pack(side=tk.LEFT, padx=2)
-                            volume_label = ttk.Label(row_frame, text=f"{user_volume:.1f}", width=3)
-                            volume_label.pack(side=tk.LEFT, padx=2)
-                            volume_var.trace('w', lambda *args, uid=user_id, uname=username: self._on_user_volume_change(uid, uname))
-                            
-                            # Store button references
-                            self.user_buttons[user_id] = {"solo": solo_btn, "mute": mute_btn, "volume_var": volume_var, "volume_scale": volume_scale, "volume_label": volume_label}
-                            
-                        except (ValueError, IndexError):
+                            buttons["row_frame"].destroy()
+                        except Exception:
                             pass
-            else:
-                # No users online
-                ttk.Label(self.users_scroll_frame, text="(暂无用户在线)", foreground="gray").pack(pady=10)
-        else:
+                    del self.user_buttons[user_id]
+                if user_id in self.user_id_map:
+                    del self.user_id_map[user_id]
+            
+            # Add new users
+            added_ids = new_ids - old_ids
+            for user_id in added_ids:
+                username = new_id_to_name[user_id]
+                self.user_id_map[user_id] = username
+                self._add_user_row(user_id, username)
+            
+            # Update user_id_map with latest names
+            self.user_id_map.clear()
+            for user_id, username in new_id_to_name.items():
+                self.user_id_map[user_id] = username
+            
+            # Show/hide "no users" label
+            has_visible_users = any(
+                uid != self.my_user_id for uid in self.user_id_map
+            ) if self.user_id_map else False
+            self._update_empty_label(has_visible_users)
+            
+        except Exception:
             ttk.Label(self.users_scroll_frame, text=message, foreground="gray").pack(pady=10)
+    
+    def _add_user_row(self, user_id, username):
+        """Add a single user row to the display."""
+        row_frame = ttk.Frame(self.users_scroll_frame)
+        row_frame.pack(fill=tk.X, pady=2, padx=5)
+        
+        # Username label
+        name_label = ttk.Label(row_frame, text=username, width=15, anchor=tk.W)
+        name_label.pack(side=tk.LEFT, padx=5)
+        
+        # Solo button
+        solo_active = user_id in self.solo_users
+        solo_bg = "#228B22" if solo_active else "#90EE90"
+        solo_btn = tk.Button(row_frame, text="S", bg=solo_bg, width=3, height=1,
+                           command=lambda uid=user_id, uname=username: self._toggle_solo(uid, uname))
+        solo_btn.pack(side=tk.LEFT, padx=2)
+        
+        # Mute button
+        mute_active = user_id in self.muted_users
+        mute_bg = "#CC0000" if mute_active else "#FFB6C1"
+        mute_btn = tk.Button(row_frame, text="M", bg=mute_bg, width=3, height=1,
+                           command=lambda uid=user_id, uname=username: self._toggle_mute(uid, uname))
+        mute_btn.pack(side=tk.LEFT, padx=2)
+        
+        # Volume slider
+        user_volume = self.user_volumes.get(user_id, 1.0)
+        volume_var = tk.DoubleVar(value=user_volume)
+        volume_scale = ttk.Scale(row_frame, from_=0.0, to=2.0, variable=volume_var, orient=tk.HORIZONTAL)
+        volume_scale.pack(side=tk.LEFT, padx=2)
+        volume_label = ttk.Label(row_frame, text=f"{user_volume:.1f}", width=3)
+        volume_label.pack(side=tk.LEFT, padx=2)
+        volume_var.trace('w', lambda *args, uid=user_id, uname=username: self._on_user_volume_change(uid, uname))
+        
+        # Store button references
+        self.user_buttons[user_id] = {
+            "solo": solo_btn, "mute": mute_btn,
+            "volume_var": volume_var, "volume_scale": volume_scale,
+            "volume_label": volume_label, "row_frame": row_frame
+        }
+    
+    def _update_empty_label(self, has_visible_users):
+        """Show or hide the 'no users online' label."""
+        # Find and manage the empty label
+        for widget in self.users_scroll_frame.winfo_children():
+            if isinstance(widget, ttk.Label) and widget.cget("text") == "(暂无用户在线)":
+                if has_visible_users:
+                    widget.pack_forget()
+                return
+        
+        if not has_visible_users:
+            ttk.Label(self.users_scroll_frame, text="(暂无用户在线)", foreground="gray").pack(pady=10)
     
     def _toggle_solo(self, user_id, username):
         """Toggle solo mode for a user."""
@@ -740,8 +666,26 @@ class VoiceChatGUI:
             self._log(f"已设置用户 {username} 的音量为 {new_volume:.1f}")
     
     def _apply_user_volume(self, data: bytes, user_id: int) -> bytes:
-        """Apply per-user volume to audio data."""
+        """Apply per-user volume to audio data with active speaker normalization.
+        
+        actual_volume = volume_setting * (1 / unmuted_active_speaker_count)
+        Clean up stale speakers (no audio for >2 seconds).
+        Only unmuted (not in muted_users) active speakers count toward normalization.
+        If listen_own is enabled, count includes self (+1).
+        """
         volume = self.user_volumes.get(user_id, 1.0)
+        # Clean up stale speakers and count active ones
+        now = time.time()
+        stale = [uid for uid, t in self._active_audio_users.items() if now - t > 2.0]
+        for uid in stale:
+            del self._active_audio_users[uid]
+        # Only count unmuted users in active_count
+        unmuted_active = [uid for uid in self._active_audio_users if uid not in self.muted_users]
+        active_count = len(unmuted_active)
+        if self.listen_own:
+            active_count += 1
+        active_count = max(1, active_count)
+        volume = volume / active_count
         if volume == 1.0:
             return data
         samples = array.array('h', data)
@@ -841,7 +785,10 @@ class VoiceChatGUI:
             raise
         
     def _connect_thread(self, host, port, name, password):
-        """Background thread to establish connection to server."""
+        """Background thread to establish connection to server using UDP+RUDP."""
+        # Store params for auto-reconnection
+        self._reconnect_params = (host, port, name, password)
+        self._auto_reconnect = True
         try:
             # Ensure old connection is fully cleaned up
             self.running = False
@@ -860,50 +807,43 @@ class VoiceChatGUI:
             # Wait for socket to fully close
             time.sleep(0.3)
             
-            self.compressor = AudioCompressor(level=6)
+            self.compressor = AudioCompressor(bitrate=32000)
+            self.server_addr = (host, port)
             
-            # Step 1: Temporary connection to receive server's RSA public key for fingerprint verification
-            self.sock_audio = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock_audio.settimeout(10)
+            # Step 1: Create UDP socket for all communication
+            self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp_sock.settimeout(5)  # 5 second timeout for auth
+            self.udp_sock.bind(('0.0.0.0', 0))
+            self.root.after(0, self._log, f"UDP套接字已创建，本地端口: {self.udp_sock.getsockname()[1]}")
+            
+            # Step 2: Create RUDP endpoint for reliable control messages
+            self.rudp_endpoint = RUDPEndpoint(self.udp_sock, self.server_addr)
+            
+            # Step 3: Request RSA public key from server (empty payload)
             self.root.after(0, self._log, f"正在连接 {host}:{port}...")
-            self.sock_audio.connect((host, port))
-            self.sock_audio.settimeout(None)
+            self.root.after(0, self._log, "请求服务器 RSA 公钥...")
             
-            self.root.after(0, self._log, "接收服务器 RSA 公钥...")
-            pub_key_len_data = self._recv_exact(4)
-            if not pub_key_len_data:
+            # Use send_and_wait for reliable delivery of RSA key request
+            result = self.rudp_endpoint.send_and_wait(MSG_TYPE_JOIN, b'', timeout=10)
+            if result is None:
+                raise Exception("服务器无响应，获取RSA公钥超时")
+            
+            msg_type, payload = result
+            if msg_type != MSG_TYPE_JOIN:
+                raise Exception(f"收到意外的消息类型: {msg_type}")
+            
+            # Parse public key: [pub_key_len(4)][public_key_bytes]
+            if len(payload) < 4:
                 raise Exception("服务器响应格式错误")
+            pub_key_len = struct.unpack('!I', payload[:4])[0]
+            public_key_bytes = payload[4:4+pub_key_len]
             
-            pub_key_len = struct.unpack('!I', pub_key_len_data)[0]
-            public_key_bytes = self._recv_exact(pub_key_len)
-            if not public_key_bytes:
-                raise Exception("服务器公钥接收失败")
-            
-            # Step 2: Close temporary connection before showing fingerprint dialog
-            self.sock_audio.close()
-            self.sock_audio = None
-            self.root.after(0, self._log, "等待用户确认服务器指纹...")
-            
-            # Step 3: Verify server fingerprint (SSH-style trust)
-            server_addr = f"{host}:{port}"
-            if not self._verify_server_fingerprint(server_addr, public_key_bytes):
+            # Step 5: Verify server fingerprint (SSH-style trust)
+            server_addr_str = f"{host}:{port}"
+            if not self._verify_server_fingerprint(server_addr_str, public_key_bytes):
                 raise Exception("服务器指纹验证失败，连接已终止")
             
-            # Step 4: User approved, establish actual connection
-            self.sock_audio = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock_audio.settimeout(10)
-            self.sock_audio.connect((host, port))
-            # Keep 10s timeout for handshake, will set to None after auth success
-            
-            # Step 5: Receive RSA public key again (new connection)
-            pub_key_len_data = self._recv_exact(4)
-            if not pub_key_len_data:
-                raise Exception("服务器响应格式错误")
-            
-            pub_key_len = struct.unpack('!I', pub_key_len_data)[0]
-            public_key_bytes = self._recv_exact(pub_key_len)
-            if not public_key_bytes:
-                raise Exception("服务器公钥接收失败")
+            self.root.after(0, self._log, "服务器指纹验证通过")
             
             # Step 6: Encrypt password with RSA public key
             public_key = RSA.import_key(public_key_bytes)
@@ -920,78 +860,76 @@ class VoiceChatGUI:
             # Step 8: Send JOIN packet with encrypted password and device fingerprints
             name_bytes = name.encode('utf-8')
             fingerprints_json = json.dumps(device_fingerprints).encode('utf-8')
-            join_packet = (
-                struct.pack('!BI', MSG_TYPE_JOIN, len(name_bytes)) + name_bytes +
+            join_data = (
+                struct.pack('!I', len(name_bytes)) + name_bytes +
                 struct.pack('!I', len(encrypted_password)) + encrypted_password +
                 struct.pack('!I', len(fingerprints_json)) + fingerprints_json
             )
-            self.root.after(0, self._log, f"发送加入请求，包大小: {len(join_packet)} 字节")
-            with self._send_lock:
-                self.sock_audio.sendall(join_packet)
             
-            self.root.after(0, self._log, "等待服务器响应...")
+            self.root.after(0, self._log, f"发送加入请求，包大小: {len(join_data)} 字节")
             
-            # Set timeout for receiving response
-            self.sock_audio.settimeout(15)
-            try:
-                response_type_data = self._recv_exact(1)
-                if not response_type_data:
-                    raise Exception("服务器无响应，连接超时")
-            except socket.timeout:
-                raise Exception("等待服务器响应超时")
+            # Use RUDP send_and_wait for reliable delivery
+            result = self.rudp_endpoint.send_and_wait(MSG_TYPE_JOIN, join_data, timeout=15)
+            if result is None:
+                raise Exception("服务器无响应，认证超时")
             
-            response_type = struct.unpack('!B', response_type_data[:1])[0]
-            self.root.after(0, self._log, f"收到响应类型: {response_type}")
+            msg_type, payload = result
+            self.root.after(0, self._log, f"收到响应类型: {msg_type}")
             
-            if response_type == MSG_TYPE_AUTH_FAIL:
+            if msg_type == MSG_TYPE_AUTH_FAIL:
                 raise Exception("密码错误，身份验证失败")
-            elif response_type == MSG_TYPE_BANNED:
+            elif msg_type == MSG_TYPE_BANNED:
                 raise Exception("设备已被封禁")
-            elif response_type == MSG_TYPE_ADMIN_NOT_ONLINE:
-                raise Exception("服务器未允许加入：管理员未在线")
-            elif response_type == MSG_TYPE_AUTH_SUCCESS:
+            elif msg_type == MSG_TYPE_DUPLICATE_NAME:
+                raise Exception("昵称已被占用，请更换昵称后重试")
+            elif msg_type == MSG_TYPE_AUTH_SUCCESS:
                 # Format: [salt(32)][nonce(12)][tag(16)][encrypted_session_key(32)][user_id(4)]
-                response_data = self._recv_exact(96)
-                if not response_data or len(response_data) < 96:
+                if len(payload) < 96:
                     raise Exception("服务器响应格式错误")
                 
-                salt = response_data[0:32]
-                nonce = response_data[32:44]
-                tag = response_data[44:60]
-                encrypted_session_key = response_data[60:92]
-                self.my_user_id = struct.unpack('!I', response_data[92:96])[0]
+                salt = payload[0:32]
+                nonce = payload[32:44]
+                tag = payload[44:60]
+                encrypted_session_key = payload[60:92]
+                self.my_user_id = struct.unpack('!I', payload[92:96])[0]
                 
-                # Use server-provided random salt (more secure than deriving salt from password)
+                # Derive session key
                 derived_key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
                 cipher = AES.new(derived_key, AES.MODE_GCM, nonce=nonce)
                 self.session_key = cipher.decrypt_and_verify(encrypted_session_key, tag)
                 
                 self.audio_encryptor = SessionKeyEncryptor(self.session_key)
+                self.root.after(0, self._log, f"认证成功，user_id: {self.my_user_id}")
                 
                 # Receive recording notice from server
                 self.root.after(0, self._log, "接收服务器录音状态通知...")
                 try:
-                    self.sock_audio.settimeout(5)
-                    notice_type_data = self._recv_exact(1)
-                    if notice_type_data:
-                        notice_type = struct.unpack('!B', notice_type_data)[0]
+                    result = self.rudp_endpoint.handle_incoming_wait(timeout=5)
+                    if result is not None:
+                        notice_type, notice_payload = result
                         if notice_type == MSG_TYPE_RECORDING_NOTICE:
+                            # Decrypt the recording notice
+                            if self.audio_encryptor:
+                                notice_payload = self.audio_encryptor.decrypt(notice_payload)
+                                if notice_payload is None:
+                                    raise Exception("录音通知解密失败")
+                            
                             # Parse recording notice
-                            recording_enabled_data = self._recv_exact(1)
-                            recording_enabled = struct.unpack('!B', recording_enabled_data)[0] == 1
+                            recording_enabled = struct.unpack('!B', notice_payload[:1])[0] == 1
+                            purpose_len = struct.unpack('!I', notice_payload[1:5])[0]
+                            purpose = notice_payload[5:5+purpose_len].decode('utf-8')
+                            storage_minutes = struct.unpack('!I', notice_payload[5+purpose_len:5+purpose_len+4])[0]
                             
-                            purpose_len_data = self._recv_exact(4)
-                            purpose_len = struct.unpack('!I', purpose_len_data)[0]
-                            purpose_bytes = self._recv_exact(purpose_len)
-                            purpose = purpose_bytes.decode('utf-8')
+                            # Try to parse max_size_mb if present (newer server format)
+                            expected_len = 5 + purpose_len + 4
+                            max_size_mb = 10240  # Default
+                            if len(notice_payload) >= expected_len + 4:
+                                max_size_mb = struct.unpack('!I', notice_payload[expected_len:expected_len+4])[0]
                             
-                            storage_minutes_data = self._recv_exact(4)
-                            storage_minutes = struct.unpack('!I', storage_minutes_data)[0]
-                            
-                            # Store recording info
                             self.server_recording_enabled = recording_enabled
                             self.server_recording_purpose = purpose
                             self.server_recording_storage = storage_minutes
+                            self.server_recording_max_size = max_size_mb
                             
                             self.root.after(0, self._log, 
                                 f"服务器录音状态: {'已开启' if recording_enabled else '未开启'}")
@@ -1002,36 +940,81 @@ class VoiceChatGUI:
                 except Exception as e:
                     self.root.after(0, self._log, f"接收录音通知失败: {e}")
                     self.server_recording_enabled = False
-                
-                connected = True
             else:
                 raise Exception("未知的服务器响应")
             
-            # Set socket to non-blocking for audio
-            self.sock_audio.settimeout(None)
+            # Check admin online status
+            self._admin_online = True  # Default: assume admin is online
+            try:
+                result = self.rudp_endpoint.handle_incoming_wait(timeout=2)
+                if result is not None:
+                    check_msg_type, check_payload = result
+                    if check_msg_type == MSG_TYPE_ADMIN_OFFLINE:
+                        self._admin_online = False
+                        self.root.after(0, self._log, "管理员未在线，等待管理员上线...")
+                    # Other messages (USER_JOINED, USER_LIST) are consumed here,
+                    # but user list is periodically re-broadcast by server
+            except Exception:
+                pass  # Timeout or error, assume admin is online
             
-            # Show recording notice dialog before sending audio
+            # Show recording consent dialog before sending audio
             if not self._show_recording_consent_dialog():
                 raise Exception("用户不同意录音条款，连接已取消")
             
+            # Initialize audio
             self.p = pyaudio.PyAudio()
             self.player = AudioPlayer(self.p)
             
             self.running = True
             self.connected = True
             
-            # 启动独立的心跳线程，确保即使音频发送阻塞也能正常发送心跳
+            # Drain stale audio packets from OS socket buffer.
+            # Between auth success and thread start, the server is already
+            # forwarding audio from existing clients. These packets accumulate
+            # in the OS socket buffer and would flood the JitterBuffer on startup,
+            # causing a multi-second initial delay. We discard them here so the
+            # JitterBuffer starts fresh with only new, real-time packets.
+            self.udp_sock.settimeout(0.05)
+            stale_count = 0
+            while True:
+                try:
+                    data, _ = self.udp_sock.recvfrom(MAX_PACKET_SIZE)
+                    if data and len(data) >= 1:
+                        stale_count += 1
+                except socket.timeout:
+                    break
+                except OSError:
+                    break
+            if stale_count > 0:
+                self.root.after(0, self._log, f"丢弃了 {stale_count} 个连接延迟的音频包")
+            self.udp_sock.settimeout(5)  # Reset for auth, receive loop will override
+            
+            # Start heartbeat thread (via RUDP)
             heartbeat_thread = threading.Thread(target=self._send_heartbeat, name='heartbeat', daemon=True)
             heartbeat_thread.start()
             self._active_threads.append(heartbeat_thread)
             
+            # Start audio send thread (UDP)
             send_thread = threading.Thread(target=self._send_audio, name='send_audio', daemon=True)
             send_thread.start()
             self._active_threads.append(send_thread)
             
-            receive_thread = threading.Thread(target=self._receive_audio, daemon=True)
+            # Start unified receive thread (UDP + RUDP)
+            self._packet_queue = queue.Queue(maxsize=2000)
+            receive_thread = threading.Thread(target=self._receive_loop, name='receive_loop', daemon=True)
             receive_thread.start()
             self._active_threads.append(receive_thread)
+            
+            # Start packet processing thread (decrypt + decompress offloaded from recv)
+            process_thread = threading.Thread(target=self._process_loop, name='process_loop', daemon=True)
+            process_thread.start()
+            self._active_threads.append(process_thread)
+            
+            # Initialize last packet time and start connection watchdog
+            self.last_packet_time = time.time()
+            watchdog_thread = threading.Thread(target=self._connection_watchdog, name='watchdog', daemon=True)
+            watchdog_thread.start()
+            self._active_threads.append(watchdog_thread)
             
             self.root.after(0, self._connect_success, name)
             
@@ -1047,10 +1030,21 @@ class VoiceChatGUI:
         self.listen_own_btn.config(state=tk.NORMAL)
         self.mute_check.config(state=tk.DISABLED)
         self.player.volume = self.volume_var.get()
-        self.status_var.set(f"已连接 ({name})")
-        self.status_label.config(foreground="green")
         self._log(f"已加入服务器，昵称: {name}")
-        self._log("提示：点击用户列表中的 独听列 可独听，点击 静音列 可静音。")
+        
+        if self._admin_online:
+            self.status_var.set(f"已连接 ({name})")
+            self.status_label.config(foreground="green")
+            self._log("提示：点击用户列表中的 独听列 可独听，点击 静音列 可静音。")
+        else:
+            self.status_var.set("管理员未在线，等待中...")
+            self.status_label.config(foreground="orange")
+            self._log("管理员未在线，等待管理员上线...")
+            messagebox.showwarning(
+                "管理员未在线",
+                "管理员当前未在线，您已连接但无法发送语音。\n管理员上线后语音将自动恢复。",
+                parent=self.root
+            )
         
         # Reset solo and mute state on new connection
         self.solo_users.clear()
@@ -1080,26 +1074,43 @@ class VoiceChatGUI:
         if "封禁" in message:
             self.root.after(100, self._show_banned_dialog)
         
-    def _disconnect(self):
-        """Disconnect from server and clean up resources."""
+        # Show popup and status for duplicate name
+        if "昵称已被占用" in message:
+            self.status_var.set("昵称已被占用")
+            self.root.after(100, lambda: messagebox.showwarning(
+                "昵称已被占用",
+                "该昵称已被其他用户使用，请更换昵称后重试。",
+                parent=self.root
+            ))
+        
+    def _disconnect(self, server_initiated=False):
+        """Disconnect from server and clean up resources.
+        
+        Args:
+            server_initiated: True if disconnect was initiated by server
+                              (e.g., admin left). In this case, auto-reconnect
+                              remains enabled so the client can rejoin later.
+        """
+        if not server_initiated:
+            self._auto_reconnect = False  # User manually disconnected
         # Disable button during disconnect
         self.connect_btn.config(state=tk.DISABLED)
         
         self.running = False
         self.connected = False
         
-        # Send LEAVE message
+        # Send LEAVE message via RUDP
         try:
-            if self.name and self.sock_audio:
+            if self.name and self.rudp_endpoint:
                 name_bytes = self.name.encode('utf-8')
                 if self.audio_encryptor:
                     # Encrypt leave data: [name]
                     encrypted_data = self.audio_encryptor.encrypt(name_bytes)
-                    leave_packet = struct.pack('!B', MSG_TYPE_LEAVE) + struct.pack('!I', len(encrypted_data)) + encrypted_data
+                    leave_data = struct.pack('!I', len(encrypted_data)) + encrypted_data
                 else:
-                    leave_packet = struct.pack('!BI', MSG_TYPE_LEAVE, len(name_bytes)) + name_bytes
-                with self._send_lock:
-                    self.sock_audio.sendall(leave_packet)
+                    leave_data = struct.pack('!I', len(name_bytes)) + name_bytes
+                # Fire-and-forget, don't wait for response
+                self.rudp_endpoint.send_raw(MSG_TYPE_LEAVE, leave_data)
                 import time
                 time.sleep(0.3)
         except Exception:
@@ -1117,6 +1128,18 @@ class VoiceChatGUI:
         # Re-enable button
         self.connect_btn.config(state=tk.NORMAL)
         
+        # If server initiated disconnect and auto-reconnect is allowed,
+        # start a new watchdog for auto-reconnection
+        if server_initiated and self._reconnect_params and self._auto_reconnect:
+            self._log("服务器断开连接，将自动尝试重连...")
+            self.running = True
+            self.last_packet_time = time.time()
+            watchdog_thread = threading.Thread(target=self._connection_watchdog, name='watchdog', daemon=True)
+            watchdog_thread.start()
+            self._active_threads.append(watchdog_thread)
+        elif server_initiated:
+            self._log("服务器断开连接，不自动重连")
+        
     def _cleanup(self):
         """Clean up all network and audio resources."""
         # Stop local listening first and wait for it to finish
@@ -1125,10 +1148,6 @@ class VoiceChatGUI:
         # Stop running flag to signal threads to exit
         self.running = False
         
-        # Wait briefly for threads to notice the flag change
-        import time
-        time.sleep(0.3)
-        
         # Stop player first (it may be using audio output)
         if self.player:
             try:
@@ -1136,26 +1155,31 @@ class VoiceChatGUI:
             except Exception:
                 pass
             self.player = None
-            
-        # Close network socket
-        if self.sock_audio:
-            try:
-                self.sock_audio.close()
-            except Exception:
-                pass
-            self.sock_audio = None
         
-        # Close signal socket
-        if self.sock_signal:
+        # Close RUDP endpoint
+        if self.rudp_endpoint:
             try:
-                self.sock_signal.close()
+                self.rudp_endpoint.close()
             except Exception:
                 pass
-            self.sock_signal = None
+            self.rudp_endpoint = None
+        
+        # Close UDP socket
+        if self.udp_sock:
+            try:
+                self.udp_sock.close()
+            except Exception:
+                pass
+            self.udp_sock = None
+        
+        # Clean up old TCP socket references (no longer used)
+        self.sock_audio = None
+        self.sock_signal = None
             
-        # Wait for active threads to finish
+        # Wait for active threads to finish (skip current thread)
+        current = threading.current_thread()
         for t in self._active_threads:
-            if t.is_alive():
+            if t is not current and t.is_alive():
                 t.join(timeout=1.0)
         self._active_threads.clear()
             
@@ -1218,6 +1242,17 @@ class VoiceChatGUI:
         """Save gain setting to config."""
         self.config['gain'] = self.gain_var.get()
         self._save_config()
+    
+    def _update_noise_label(self, *args):
+        """Update noise suppression display label."""
+        self.noise_label.config(text=f"{self.noise_var.get()}%")
+    
+    def _apply_noise(self, *args):
+        """Apply noise suppression threshold setting."""
+        threshold = self.noise_var.get()
+        self.noise_suppressor.threshold = threshold
+        self.config['noise_threshold'] = threshold
+        self._save_config()
             
     def _toggle_listen_own(self):
         """Toggle local audio monitoring."""
@@ -1259,7 +1294,7 @@ class VoiceChatGUI:
         self._listen_btn_lock = False
             
     def _send_heartbeat(self):
-        """独立的心跳线程，确保即使音频发送阻塞也能正常发送心跳。"""
+        """独立的心跳线程，通过RUDP发送心跳。"""
         try:
             if not hasattr(self, 'audio_encryptor') or self.audio_encryptor is None:
                 return
@@ -1273,9 +1308,8 @@ class VoiceChatGUI:
                     if current_time - last_heartbeat_time >= heartbeat_interval:
                         name_bytes = self.name.encode('utf-8')
                         encrypted_data = self.audio_encryptor.encrypt(name_bytes)
-                        heartbeat_packet = struct.pack('!B', MSG_TYPE_HEARTBEAT) + struct.pack('!I', len(encrypted_data)) + encrypted_data
-                        with self._send_lock:
-                            self.sock_audio.sendall(heartbeat_packet)
+                        heartbeat_data = struct.pack('!I', len(encrypted_data)) + encrypted_data
+                        self.rudp_endpoint.send_raw(MSG_TYPE_HEARTBEAT, heartbeat_data)
                         last_heartbeat_time = current_time
                     time.sleep(0.5)  # 短暂休眠，避免CPU占用过高
                 except Exception as e:
@@ -1287,10 +1321,14 @@ class VoiceChatGUI:
                 self._log(f"心跳线程错误: {e}")
     
     def _send_audio(self):
-        """Capture microphone audio and send to server via TCP."""
+        """Capture microphone audio and send to server via UDP."""
         try:
             if not hasattr(self, 'audio_encryptor') or self.audio_encryptor is None:
                 self._log("音频加密模块未初始化，无法发送音频")
+                return
+            
+            if self.udp_sock is None or self.server_addr is None:
+                self._log("UDP套接字或服务器地址未配置，无法发送音频")
                 return
             
             kwargs = {
@@ -1301,7 +1339,7 @@ class VoiceChatGUI:
                 'frames_per_buffer': CHUNK
             }
             stream = self.p.open(**kwargs)
-            self._log("麦克风已打开，正在发送音频...")
+            self._log("麦克风已打开")
             
             packet_count = 0
             
@@ -1309,9 +1347,18 @@ class VoiceChatGUI:
                 try:
                     data = stream.read(CHUNK, exception_on_overflow=False)
                     original_data = data
+                    
+                    # Admin offline: don't send audio (not even silence), but still provide local monitoring
+                    if not self._admin_online:
+                        if self.listen_own and self.player:
+                            self.player.push(self.my_user_id or 0, original_data)
+                        continue
+                    
+                    # Apply noise suppression before gain/mute (noise gate)
+                    data = self.noise_suppressor.process(data)
+                    
                     gain = self.config.get('gain', 1.0)
                     if self.mute:
-                        # Generate silence by creating zero bytes of same length
                         data = b'\x00' * len(data)
                     elif gain != 1.0:
                         samples = array.array('h', data)
@@ -1322,19 +1369,29 @@ class VoiceChatGUI:
                     compressed_data = self.compressor.compress(data)
                     encrypted_data = self.audio_encryptor.encrypt(compressed_data)
                     timestamp = time.time()
-                    header = struct.pack('!B', MSG_TYPE_AUDIO) + struct.pack('!d', timestamp) + struct.pack('!I', len(encrypted_data))
+                    
+                    # UDP packet format: [msg_type(1)][user_id(4)][timestamp(8)][encrypted_len(4)][encrypted_audio]
+                    header = (
+                        struct.pack('!B', MSG_TYPE_AUDIO) +
+                        struct.pack('!I', self.my_user_id) +
+                        struct.pack('!d', timestamp) +
+                        struct.pack('!I', len(encrypted_data))
+                    )
                     packet = header + encrypted_data
-                    with self._send_lock:
-                        self.sock_audio.sendall(packet)
+                    
+                    try:
+                        self.udp_sock.sendto(packet, self.server_addr)
+                    except Exception as e:
+                        if self.running:
+                            self._log(f"UDP发送音频失败: {e}")
                     
                     packet_count += 1
                     if packet_count <= 3:
-                        self._log(f"已发送第 {packet_count} 个音频包，大小: {len(packet)}")
+                        self._log(f"UDP已发送第 {packet_count} 个音频包，大小: {len(packet)}")
                     
                     if self.listen_own and self.player:
-                        self.player.push(original_data)
+                        self.player.push(self.my_user_id or 0, original_data)
                 except Exception as e:
-                    # Always log send failures regardless of mute state
                     if self.running:
                         self._log(f"发送音频失败: {e}")
                     break
@@ -1424,7 +1481,7 @@ class VoiceChatGUI:
                             samples = array.array('h', [int(s * gain) for s in samples])
                             samples = array.array('h', [max(-32768, min(32767, s)) for s in samples])
                             data = samples.tobytes()
-                        local_player.push(data)
+                        local_player.push(0, data)
                 else:
                     break
             except Exception:
@@ -1432,124 +1489,269 @@ class VoiceChatGUI:
                     break
                 time.sleep(0.01)
             
-    def _receive_audio(self):
-        """Receive and process incoming audio from server via TCP."""
-        self._log("开始接收音频...")
+    def _receive_loop(self):
+        """Fast packet reader - reads raw packets and queues them.
+        
+        Decryption, decompression, and audio mixing are offloaded to
+        _process_loop to keep the UDP receive buffer from filling up
+        when 6+ users send 180+ packets/sec.
+        """
+        self._log("开始通过UDP接收音频和控制消息...")
+        
+        while self.running:
+            if self.udp_sock is None:
+                time.sleep(0.1)
+                continue
+            
+            try:
+                data, addr = self.udp_sock.recvfrom(MAX_PACKET_SIZE)
+                if not data or len(data) < 1:
+                    continue
+                
+                try:
+                    self._packet_queue.put_nowait((data, addr))
+                except queue.Full:
+                    pass  # Drop oldest implicitly by not putting
+                    
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.running:
+                    time.sleep(0.01)
+                continue
+            except Exception as e:
+                if self.running:
+                    self._log(f"UDP接收出错: {e}")
+                time.sleep(0.1)
+    
+    def _process_loop(self):
+        """Process packets from the queue: decrypt, decompress, mix audio.
+        
+        Runs in a separate thread so the receive loop never blocks on
+        CPU-intensive operations like AES-GCM decryption and zlib decompression.
+        """
         audio_count = 0
-        buffer = b''
         
         while self.running:
             try:
-                data = self.sock_audio.recv(MAX_PACKET_SIZE)
-                if not data:
-                    self._log("服务器断开连接")
-                    break
+                data, addr = self._packet_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            
+            self.last_packet_time = time.time()
+            
+            try:
+                msg_type = struct.unpack('!B', data[:1])[0]
                 
-                buffer += data
-                
-                while len(buffer) >= 1:
-                    msg_type = struct.unpack('!B', buffer[:1])[0]
+                if msg_type == MSG_TYPE_AUDIO:
+                    # Parse audio packet: [msg_type(1)][sender_id(4)][sender_name_len(1)][sender_name(N)][timestamp(8)][encrypted_len(4)][encrypted_audio]
+                    if len(data) < 14:
+                        continue
                     
-                    if msg_type == MSG_TYPE_AUDIO:
-                        # New format: [msg_type(1)][sender_id(4)][sender_name_len(1)][sender_name(N)][timestamp(8)][encrypted_len(4)][encrypted_audio]
-                        if len(buffer) < 14:  # 1 + 4 + 1 + 8 minimum
-                            break
-                        
-                        sender_id = struct.unpack('!I', buffer[1:5])[0]
-                        sender_name_len = struct.unpack('!B', buffer[5:6])[0]
-                        
-                        if len(buffer) < 6 + sender_name_len + 12:
-                            break
-                        
-                        sender_name = buffer[6:6+sender_name_len].decode('utf-8')
-                        offset = 6 + sender_name_len
-                        
-                        timestamp = struct.unpack('!d', buffer[offset:offset+8])[0]
-                        encrypted_len = struct.unpack('!I', buffer[offset+8:offset+12])[0]
-                        
-                        if len(buffer) < offset + 12 + encrypted_len:
-                            break
-                        
-                        encrypted_data = buffer[offset+12:offset+12+encrypted_len]
-                        buffer = buffer[offset+12+encrypted_len:]
-                        
-                        # Check solo/mute logic: solo has higher priority than mute
-                        # If there are solo users, only play their audio
-                        if self.solo_users:
-                            if sender_id not in self.solo_users:
-                                continue
-                        else:
-                            # No solo users, check mute list
-                            if sender_id in self.muted_users:
-                                continue
-                        
-                        if not self.audio_encryptor:
+                    sender_id = struct.unpack('!I', data[1:5])[0]
+                    sender_name_len = struct.unpack('!B', data[5:6])[0]
+                    
+                    if len(data) < 6 + sender_name_len + 12:
+                        continue
+                    
+                    sender_name = data[6:6+sender_name_len].decode('utf-8')
+                    offset = 6 + sender_name_len
+                    
+                    encrypted_len = struct.unpack('!I', data[offset+8:offset+12])[0]
+                    if len(data) < offset + 12 + encrypted_len:
+                        continue
+                    
+                    encrypted_data = data[offset+12:offset+12+encrypted_len]
+                    
+                    # Check solo/mute logic
+                    if self.solo_users:
+                        if sender_id not in self.solo_users:
                             continue
-                            
-                        audio_count += 1
-                        compressed_data = self.audio_encryptor.decrypt(encrypted_data)
-                        if compressed_data and self.compressor:
-                            pcm_data = self.compressor.decompress(compressed_data)
-                            # Apply per-user volume
-                            pcm_data = self._apply_user_volume(pcm_data, sender_id)
-                            if self.player:
-                                self.player.push(pcm_data)
-                    elif msg_type == MSG_TYPE_USER_LIST:
-                        # Format: [msg_type(1)][encrypted_len(4)][encrypted_data]
-                        if len(buffer) < 5:
-                            break
-                        encrypted_len = struct.unpack('!I', buffer[1:5])[0]
-                        if len(buffer) < 5 + encrypted_len:
-                            break
-                        encrypted_data = buffer[5:5+encrypted_len]
-                        buffer = buffer[5+encrypted_len:]
-                        if self.audio_encryptor:
-                            decrypted_data = self.audio_encryptor.decrypt(encrypted_data)
-                            if decrypted_data:
-                                user_list = decrypted_data.decode('utf-8')
-                                self.root.after(0, self._update_users, user_list)
-                    elif msg_type == MSG_TYPE_USER_JOINED:
-                        # Format: [msg_type(1)][encrypted_len(4)][encrypted_data]
-                        if len(buffer) < 5:
-                            break
-                        encrypted_len = struct.unpack('!I', buffer[1:5])[0]
-                        if len(buffer) < 5 + encrypted_len:
-                            break
-                        encrypted_data = buffer[5:5+encrypted_len]
-                        buffer = buffer[5+encrypted_len:]
-                        if self.audio_encryptor:
-                            decrypted_data = self.audio_encryptor.decrypt(encrypted_data)
-                            if decrypted_data:
-                                event = decrypted_data.decode('utf-8')
-                                self.root.after(0, self._log, f"[用户事件] {event}")
-                    elif msg_type == MSG_TYPE_BANNED:
-                        buffer = b''
-                        self._log("您的设备已被管理员封禁，连接将被断开")
-                        self.running = False
-                        self.root.after(0, self._show_banned_dialog)
-                        self.root.after(100, self._disconnect)
-                        break
-                    elif msg_type == MSG_TYPE_LEAVE:
-                        buffer = b''
-                        self._log("管理员已退出，所有用户将被强制断开连接")
-                        self.running = False
-                        self.root.after(0, self._disconnect)
-                        break
                     else:
-                        buffer = buffer[1:]
-            except ConnectionResetError:
-                self._log("连接被服务器重置")
-                break
-            except socket.timeout:
-                # Ignore timeout when no other users are online
-                if len(self.user_id_map) > 1:  # More than just self
-                    if self.running:
-                        self._log(f"接收音频超时")
-                time.sleep(0.1)
+                        if sender_id in self.muted_users:
+                            continue
+                    
+                    if not self.audio_encryptor:
+                        continue
+                    
+                    audio_count += 1
+                    compressed_data = self.audio_encryptor.decrypt(encrypted_data)
+                    if compressed_data and self.compressor:
+                        pcm_data = self.compressor.decompress(compressed_data, user_id=sender_id)
+                        self._active_audio_users[sender_id] = time.time()
+                        pcm_data = self._apply_user_volume(pcm_data, sender_id)
+                        if self.player:
+                            self.player.push(sender_id, pcm_data)
+                    
+                else:
+                    # Control message - handle via RUDP
+                    result = self.rudp_endpoint.handle_incoming(data)
+                    if result is not None:
+                        ctrl_msg_type, payload = result
+                        self._handle_control_message(ctrl_msg_type, payload)
+                        
             except Exception as e:
                 if self.running:
-                    self._log(f"接收音频出错: {e}")
-                time.sleep(0.1)
+                    self._log(f"包处理出错: {e}")
+    
+    def _handle_control_message(self, msg_type, payload):
+        """Handle a control message received via RUDP."""
+        if msg_type == MSG_TYPE_USER_LIST:
+            if self.audio_encryptor:
+                decrypted_data = self.audio_encryptor.decrypt(payload)
+                if decrypted_data:
+                    user_list = decrypted_data.decode('utf-8')
+                    self.root.after(0, self._update_users, user_list)
+        elif msg_type == MSG_TYPE_USER_JOINED:
+            if self.audio_encryptor:
+                decrypted_data = self.audio_encryptor.decrypt(payload)
+                if decrypted_data:
+                    event = decrypted_data.decode('utf-8')
+                    self.root.after(0, self._log, f"[用户事件] {event}")
+        elif msg_type == MSG_TYPE_BANNED:
+            self._log("您的设备已被管理员封禁，连接将被断开")
+            self._auto_reconnect = False
+            self.running = False
+            self.root.after(0, self._show_banned_dialog)
+            self.root.after(100, self._disconnect)
+        elif msg_type == MSG_TYPE_LEAVE:
+            self._log("服务器要求断开连接（被踢出）")
+            self._auto_reconnect = False
+            self.running = False
+            self.root.after(0, self._disconnect, True)  # server_initiated=True
+        elif msg_type == MSG_TYPE_ADMIN_ONLINE:
+            self._admin_online = True
+            self.root.after(0, self._log, "管理员已上线，恢复音频传输")
+            self.root.after(0, lambda: self.status_var.set(f"已连接 ({self.name})"))
+            self.root.after(0, lambda: self.status_label.config(foreground="green"))
+            self.root.after(0, self._update_text_allowed, True)
+        elif msg_type == MSG_TYPE_ADMIN_OFFLINE:
+            self._admin_online = False
+            self.root.after(0, self._log, "管理员已下线，等待管理员上线...")
+            self.root.after(0, lambda: self.status_var.set("管理员未在线，等待中..."))
+            self.root.after(0, lambda: self.status_label.config(foreground="orange"))
+            self.root.after(0, self._update_text_allowed, False)
+        elif msg_type == MSG_TYPE_HEARTBEAT:
+            # ACK for heartbeat, no action needed
+            pass
+        elif msg_type == MSG_TYPE_TEXT_MESSAGE:
+            if self.audio_encryptor:
+                decrypted_data = self.audio_encryptor.decrypt(payload)
+                if decrypted_data:
+                    text = decrypted_data.decode('utf-8')
+                    self.root.after(0, self._display_text_message, text)
+        else:
+            self._log(f"收到未知控制消息类型: {msg_type}")
+    
+    def _display_text_message(self, text: str):
+        """Display a text chat message in the chat panel."""
+        if hasattr(self, 'chat_text') and self.chat_text.winfo_exists():
+            self.chat_text.config(state=tk.NORMAL)
+            self.chat_text.insert(tk.END, text + "\n")
+            self.chat_text.see(tk.END)
+            self.chat_text.config(state=tk.DISABLED)
+    
+    def _send_text_message(self, event=None):
+        """Send a text chat message via RUDP."""
+        if not hasattr(self, 'chat_input') or not self.chat_input.winfo_exists():
+            return
+        if not self.connected:
+            self._log("未连接，无法发送文字消息")
+            return
+        if not self._text_allowed:
+            self._log("文字聊天不可用（管理员未在线）")
+            return
+        
+        text = self.chat_input.get().strip()
+        if not text:
+            return
+        if len(text) > 200:
+            self._log(f"文字消息过长（{len(text)}字符），限制200字符")
+            return
+        
+        try:
+            encrypted = self.audio_encryptor.encrypt(text.encode('utf-8'))
+            self.rudp_endpoint.send_raw(MSG_TYPE_TEXT_CHAT, encrypted)
+            self.chat_input.delete(0, tk.END)
+        except Exception as e:
+            self._log(f"发送文字消息失败: {e}")
+    
+    def _update_text_allowed(self, allowed: bool):
+        """Update text chat input availability based on admin online status."""
+        self._text_allowed = allowed
+        if hasattr(self, 'chat_input') and self.chat_input.winfo_exists():
+            if allowed:
+                self.chat_input.config(state=tk.NORMAL)
+            else:
+                self.chat_input.config(state=tk.DISABLED)
+
+    def _connection_watchdog(self):
+        """Monitor connection health and trigger auto-reconnection.
+        
+        If no packets are received for 10 seconds, the server is
+        considered dead. The watchdog triggers a full reconnection
+        with exponential backoff (1s, 2s, 4s, ... up to 60s).
+        
+        When disconnected but auto-reconnect is enabled, the watchdog
+        will keep trying to reconnect with backoff.
+        """
+        backoff = 1
+        
+        while self.running or self._auto_reconnect:
+            time.sleep(2)
+            
+            if not self._auto_reconnect:
+                if not self.running:
+                    break  # User manually disconnected, stop entirely
+                continue
+            
+            if not self.connected:
+                # Disconnected state: keep trying to reconnect
+                if self._reconnect_params:
+                    host, port, name, password = self._reconnect_params
+                    self._log(f"正在重连 {host}:{port}...")
+                    self.root.after(0, lambda: self.status_var.set("正在重连..."))
+                    try:
+                        self._connect_thread(host, port, name, password)
+                        backoff = 1  # Reset backoff on success
+                    except Exception as e:
+                        self._log(f"重连失败: {e}，{backoff}秒后重试...")
+                        time.sleep(backoff)
+                        backoff = min(backoff * 2, 60)
+                continue
+            
+            # Normal monitoring when connected
+            elapsed = time.time() - self.last_packet_time
+            if elapsed > 10:
+                self._log(f"服务器连接丢失（{elapsed:.0f}秒无数据），{backoff}秒后重连...")
+                self.root.after(0, lambda: self.status_var.set("连接丢失，正在重连..."))
+                
+                # Stop current connection
+                self.connected = False
+                self.running = False
+                
+                # Wait for threads to stop
+                time.sleep(1)
+                
+                # Cleanup
+                self._cleanup()
+                
+                # Wait before reconnecting
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                
+                # Reconnect
+                if self._reconnect_params and self._auto_reconnect:
+                    host, port, name, password = self._reconnect_params
+                    self._log(f"正在重连 {host}:{port}...")
+                    try:
+                        self._connect_thread(host, port, name, password)
+                        backoff = 1  # Reset backoff on success
+                    except Exception as e:
+                        self._log(f"重连失败: {e}")
+                        self.running = True  # Keep watchdog alive for retry
+            else:
+                backoff = 1  # Reset backoff when connection is healthy
                 
     def on_closing(self):
         if self.connected:
@@ -1558,437 +1760,21 @@ class VoiceChatGUI:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='语音聊天客户端')
-    parser.add_argument('--host', type=str, default='127.0.0.1', help='服务器地址')
-    parser.add_argument('--port', type=int, default=9090, help='服务器端口')
-    parser.add_argument('--name', type=str, default=None, help='你的昵称')
-    parser.add_argument('--password', type=str, default=None, help='加密密码')
-    parser.add_argument('--listen-own', action='store_true', help='监听自己的语音')
-    parser.add_argument('--no-listen-own', action='store_true', help='不监听自己的语音')
-    parser.add_argument('--rate', type=int, default=16000, help='音频采样率 (默认: 16000)')
-    parser.add_argument('--chunk', type=int, default=512, help='音频块大小 (默认: 512)')
-    parser.add_argument('--channels', type=int, default=1, help='音频声道数 (默认: 1)')
-    parser.add_argument('--compress-level', type=int, default=6, help='zlib压缩级别 1-9 (默认: 6)')
-    parser.add_argument('--jitter-buffer', type=int, default=3, help='抖动缓冲区大小 (默认: 3)')
-    parser.add_argument('--log-level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='日志级别')
-    parser.add_argument('--quiet', action='store_true', help='静默模式，不显示任何日志')
-    parser.add_argument('--input-device', type=int, default=None, help='音频输入设备索引')
-    parser.add_argument('--output-device', type=int, default=None, help='音频输出设备索引')
-    parser.add_argument('--list-devices', action='store_true', help='列出所有音频设备')
-    parser.add_argument('--mute', action='store_true', help='启动时静音')
-    parser.add_argument('--no-mute', action='store_true', help='启动时非静音')
-    parser.add_argument('--nogui', action='store_true', help='启动命令行界面（默认启动图形界面）')
-    args = parser.parse_args()
+    import ctypes
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
 
-    if not args.nogui:
-        if not HAS_GUI:
-            print("错误: 未安装 tkinter，无法启动图形界面，请使用 --nogui 参数启动命令行版本")
-            return
-        
-        # 设置 DPI 感知，解决高分辨率屏幕下的模糊问题
+    name_override = None
+    if '--name' in sys.argv:
         try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        except Exception:
+            idx = sys.argv.index('--name')
+            name_override = sys.argv[idx + 1]
+        except (ValueError, IndexError):
             pass
-        
-        root = tk.Tk()
-        app = VoiceChatGUI(root)
-        root.protocol("WM_DELETE_WINDOW", app.on_closing)
-        root.mainloop()
-        return
 
-    if args.quiet:
-        logging.disable(logging.CRITICAL)
-    else:
-        logging.basicConfig(
-            level=getattr(logging, args.log_level),
-            format='%(asctime)s [%(levelname)s] %(message)s',
-            force=True
-        )
-
-    global RATE, CHUNK, CHANNELS, JITTER_BUFFER_SIZE
-    RATE = args.rate
-    CHUNK = args.chunk
-    CHANNELS = args.channels
-    JITTER_BUFFER_SIZE = args.jitter_buffer
-
-    host = args.host
-    port = args.port
-
-    if args.name:
-        name = args.name
-    else:
-        name = input("你的昵称: ").strip()
-        if not name:
-            name = "匿名用户"
-
-    if args.list_devices:
-        p = pyaudio.PyAudio()
-        info = p.get_host_api_info_by_index(0)
-        num_devices = info.get('deviceCount')
-        print("可用音频设备:")
-        for i in range(num_devices):
-            device_info = p.get_device_info_by_host_api_device_index(0, i)
-            print(f"  [{i}] {device_info.get('name')} (输入: {device_info.get('maxInputChannels')}, 输出: {device_info.get('maxOutputChannels')})")
-        p.terminate()
-        return
-
-    if args.no_mute:
-        mute = False
-    elif args.mute:
-        mute = True
-    else:
-        mute = False
-
-    if args.no_listen_own:
-        listen_own = False
-    elif args.listen_own:
-        listen_own = True
-    elif args.name and args.password:
-        listen_own = False
-    else:
-        listen_own_input = input("是否监听自己的语音？(y/n) [n]: ").strip().lower()
-        listen_own = listen_own_input == 'y'
-
-    if args.password:
-        password = args.password
-    else:
-        password = getpass.getpass("加密密码: ").strip()
-    
-    if not password:
-        logger.error("密码不能为空")
-        return
-    
-    compressor = AudioCompressor(level=args.compress_level)
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    
-    logger.info(f"正在连接服务器 {host}:{port}...")
-    
-    try:
-        sock.settimeout(10)
-        sock.connect((host, port))
-        sock.settimeout(None)
-    except Exception as e:
-        logger.error(f"无法连接到服务器 {host}:{port}: {e}")
-        sock.close()
-        return
-    
-    # Step 1: Receive RSA public key from server
-    logger.info("接收服务器 RSA 公钥...")
-    pub_key_len_data = b''
-    while len(pub_key_len_data) < 4:
-        chunk = sock.recv(4 - len(pub_key_len_data))
-        if not chunk:
-            logger.error("服务器响应格式错误")
-            sock.close()
-            return
-        pub_key_len_data += chunk
-    
-    pub_key_len = struct.unpack('!I', pub_key_len_data)[0]
-    public_key_bytes = b''
-    while len(public_key_bytes) < pub_key_len:
-        chunk = sock.recv(pub_key_len - len(public_key_bytes))
-        if not chunk:
-            logger.error("服务器公钥接收失败")
-            sock.close()
-            return
-        public_key_bytes += chunk
-    
-    # Step 2: Show fingerprint for verification
-    fingerprint = hashlib.sha256(public_key_bytes).hexdigest()
-    server_addr = f"{host}:{port}"
-    logger.info(f"服务器公钥指纹: {fingerprint}")
-    
-    # Load known servers for fingerprint verification
-    if getattr(sys, 'frozen', False):
-        base_dir = os.path.dirname(sys.executable)
-    else:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-    known_servers_file = os.path.join(base_dir, 'known_servers.json')
-    known_servers = load_known_servers(known_servers_file)
-    
-    # Verify fingerprint against known servers
-    if server_addr in known_servers:
-        if fingerprint != known_servers[server_addr]:
-            logger.error(f"SECURITY WARNING: Server fingerprint mismatch for {server_addr}!")
-            logger.error(f"Expected: {known_servers[server_addr]}")
-            logger.error(f"Received: {fingerprint}")
-            logger.error("This could be a man-in-the-middle attack!")
-            print("\n" + "="*60)
-            print("⚠️ 安全警告：服务器指纹不匹配！")
-            print("="*60)
-            print(f"之前记录的指纹: {known_servers[server_addr]}")
-            print(f"当前收到的指纹: {fingerprint}")
-            print("\n这可能是中间人攻击！")
-            override = input("是否仍然连接？(y/n) [n]: ").strip().lower()
-            if override != 'y':
-                logger.info("用户拒绝不匹配的指纹，连接已取消")
-                sock.close()
-                return
-            logger.warning("用户覆盖了指纹不匹配警告")
-        else:
-            logger.info(f"Server fingerprint verified for {server_addr}")
-            print(f"✅ 服务器指纹已验证: {fingerprint}")
-    else:
-        logger.info("请通过其他可信渠道验证此指纹")
-        
-        # Show user consent notice for CLI mode
-        print("\n" + "="*60)
-        print("【隐私与使用协议】")
-        print("="*60)
-        print("\n1. 设备指纹收集:")
-        print("   为便于服务器管理，我们将收集您的设备信息")
-        print("   （包括MAC地址、CPU ID等硬件标识符）")
-        print("\n2. 同意声明:")
-        print("   继续连接即表示您同意上述数据收集和使用")
-        print("\n3. 免责声明:")
-        print("   本软件基于MIT许可证发布，不提供任何担保。")
-        print("   开发者不对因使用本软件造成的任何后果承担责任。")
-        print("   请遵守当地法律法规，不当使用造成的后果由使用者自行承担。")
-        print("\n" + "="*60)
-        print(f"\n服务器公钥指纹 (SHA-256):\n  {fingerprint}\n")
-        print("（录音提示将在连接成功后单独显示）")
-        
-        consent = input("\n是否继续连接？(y/n) [n]: ").strip().lower()
-        if consent != 'y':
-            logger.info("用户拒绝同意条款，连接已取消")
-            sock.close()
-            return
-        
-        logger.info("用户已同意条款，保存服务器指纹")
-        known_servers[server_addr] = fingerprint
-        save_known_servers(known_servers, known_servers_file)
-        logger.info(f"Server fingerprint saved for {server_addr}")
-    
-    # Step 3: Encrypt password with RSA public key
-    public_key = RSA.import_key(public_key_bytes)
-    cipher = PKCS1_OAEP.new(public_key)
-    encrypted_password = cipher.encrypt(password.encode('utf-8'))
-    logger.info("密码已使用 RSA-2048 加密")
-    
-    # Step 4: Get device fingerprints
-    device_fingerprints = get_device_fingerprint()
-    fp_summary = f"MAC:{device_fingerprints['mac'][:16]} CPU:{device_fingerprints['cpu'][:16]}"
-    logger.info(f"设备指纹: {fp_summary}")
-    
-    # Step 5: Send JOIN packet with encrypted password and device fingerprints
-    name_bytes = name.encode('utf-8')
-    fingerprints_json = json.dumps(device_fingerprints).encode('utf-8')
-    join_packet = (
-        struct.pack('!BI', MSG_TYPE_JOIN, len(name_bytes)) + name_bytes +
-        struct.pack('!I', len(encrypted_password)) + encrypted_password +
-        struct.pack('!I', len(fingerprints_json)) + fingerprints_json
-    )
-    sock.sendall(join_packet)
-    
-    response_type_data = b''
-    while len(response_type_data) < 1:
-        chunk = sock.recv(1 - len(response_type_data))
-        if not chunk:
-            logger.error("服务器响应格式错误")
-            sock.close()
-            return
-        response_type_data += chunk
-    
-    response_type = struct.unpack('!B', response_type_data[:1])[0]
-    
-    if response_type == MSG_TYPE_AUTH_FAIL:
-        logger.error("密码错误，身份验证失败")
-        sock.close()
-        return
-    elif response_type == MSG_TYPE_BANNED:
-        logger.error("设备已被封禁")
-        sock.close()
-        return
-    elif response_type == MSG_TYPE_ADMIN_NOT_ONLINE:
-        logger.error("服务器未允许加入：管理员未在线")
-        sock.close()
-        return
-    elif response_type != MSG_TYPE_AUTH_SUCCESS:
-        logger.error("未知的服务器响应")
-        sock.close()
-        return
-    
-    response_data = b''
-    while len(response_data) < 96:
-        chunk = sock.recv(96 - len(response_data))
-        if not chunk:
-            logger.error("服务器响应不完整")
-            sock.close()
-            return
-        response_data += chunk
-    
-    salt = response_data[0:32]
-    nonce = response_data[32:44]
-    tag = response_data[44:60]
-    encrypted_session_key = response_data[60:92]
-    my_user_id = struct.unpack('!I', response_data[92:96])[0]
-    
-    # Use server-provided random salt (more secure than deriving salt from password)
-    derived_key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
-    cipher = AES.new(derived_key, AES.MODE_GCM, nonce=nonce)
-    session_key = cipher.decrypt_and_verify(encrypted_session_key, tag)
-    
-    audio_encryptor = SessionKeyEncryptor(session_key)
-    
-    # Receive recording notice from server
-    logger.info("接收服务器录音状态通知...")
-    try:
-        sock.settimeout(5)
-        notice_type_data = b''
-        while len(notice_type_data) < 1:
-            chunk = sock.recv(1 - len(notice_type_data))
-            if not chunk:
-                break
-            notice_type_data += chunk
-        
-        if notice_type_data:
-            notice_type = struct.unpack('!B', notice_type_data)[0]
-            if notice_type == MSG_TYPE_RECORDING_NOTICE:
-                # Parse recording notice
-                recording_enabled_data = b''
-                while len(recording_enabled_data) < 1:
-                    chunk = sock.recv(1 - len(recording_enabled_data))
-                    if not chunk:
-                        break
-                    recording_enabled_data += chunk
-                recording_enabled = struct.unpack('!B', recording_enabled_data)[0] == 1
-                
-                purpose_len_data = b''
-                while len(purpose_len_data) < 4:
-                    chunk = sock.recv(4 - len(purpose_len_data))
-                    if not chunk:
-                        break
-                    purpose_len_data += chunk
-                purpose_len = struct.unpack('!I', purpose_len_data)[0]
-                
-                purpose_bytes = b''
-                while len(purpose_bytes) < purpose_len:
-                    chunk = sock.recv(purpose_len - len(purpose_bytes))
-                    if not chunk:
-                        break
-                    purpose_bytes += chunk
-                purpose = purpose_bytes.decode('utf-8')
-                
-                storage_minutes_data = b''
-                while len(storage_minutes_data) < 4:
-                    chunk = sock.recv(4 - len(storage_minutes_data))
-                    if not chunk:
-                        break
-                    storage_minutes_data += chunk
-                storage_minutes = struct.unpack('!I', storage_minutes_data)[0]
-                
-                # Show recording notice
-                if recording_enabled:
-                    storage_hours = storage_minutes / 60
-                    if storage_hours >= 1:
-                        storage_text = f"{storage_hours:.1f} 小时"
-                    else:
-                        storage_text = f"{storage_minutes} 分钟"
-                    
-                    print("\n" + "="*60)
-                    print("⚠️ 服务器录音提示")
-                    print("="*60)
-                    print(f"\n服务器状态: 已开启音频录制\n")
-                    print(f"录音目的:\n  {purpose}\n")
-                    print(f"存储期限:\n  {storage_text}（按文件大小自动轮转）\n")
-                    print(f"录音方式:\n")
-                    print(f"  - 格式: WAV (PCM 32-bit)")
-                    print(f"  - 采样率: 16000 Hz")
-                    print(f"  - 声道: 单声道")
-                    print(f"  - 文件轮转: 每 {storage_minutes} 分钟生成新文件")
-                    print(f"  - 存储位置: 服务器本地 recordings/ 目录\n")
-                    print(f"录音范围:\n")
-                    print(f"  - 录制您发送的所有音频数据")
-                    print(f"  - 解密后的原始音频保存到服务器")
-                    print(f"  - 按用户分别存储，文件名格式: 用户名_时间戳.wav\n")
-                    print("="*60)
-                    print("\n继续连接即表示您同意服务器录制您的音频。")
-                    print("如不同意，请输入 'n' 断开连接。")
-                    
-                    consent = input("\n是否同意并继续？(y/n) [y]: ").strip().lower()
-                    user_consent = consent != 'n'
-                    
-                    # Send consent response to server
-                    consent_packet = struct.pack('!BB', MSG_TYPE_RECORDING_CONSENT, 1 if user_consent else 0)
-                    sock.sendall(consent_packet)
-                    logger.info(f"已发送录音同意响应: {'同意' if user_consent else '拒绝'}")
-                    
-                    if not user_consent:
-                        logger.info("用户不同意录音条款，连接已取消")
-                        sock.close()
-                        return
-                else:
-                    print("\n" + "="*60)
-                    print("✅ 服务器未开启录音")
-                    print("="*60)
-                    print(f"\n服务器状态: 未开启音频录制\n")
-                    print(f"您的语音数据不会被服务器录制保存。\n")
-                    print("="*60)
-                    input("\n按回车键继续...")
-                    
-                    # Send consent response to server (always consent=True when recording disabled)
-                    consent_packet = struct.pack('!BB', MSG_TYPE_RECORDING_CONSENT, 1)
-                    sock.sendall(consent_packet)
-                    logger.info("已发送录音同意响应: 同意（服务器未开启录音）")
-            else:
-                logger.warning(f"收到未知消息类型: {notice_type}")
-        else:
-            logger.warning("未收到服务器录音状态通知")
-    except Exception as e:
-        logger.warning(f"接收录音通知失败: {e}")
-    
-    # Set socket to non-blocking
-    sock.settimeout(None)
-    
-    logger.info(f"已加入服务器，昵称: {name}，监听自己: {'是' if listen_own else '否'}")
-        
-    print("=" * 50)
-    print("语音聊天已连接！按 Ctrl+C 退出。")
-    print("=" * 50)
-
-    p = pyaudio.PyAudio()
-
-    player = AudioPlayer(p, output_device=args.output_device)
-    
-    if listen_own:
-        logger.info("已启用监听自己的语音功能")
-
-    # Start heartbeat thread to keep connection alive
-    heartbeat_thread = threading.Thread(
-        target=send_heartbeat,
-        args=(sock, (args.host, args.port), name, audio_encryptor),
-        daemon=True
-    )
-    heartbeat_thread.start()
-
-    send_thread = threading.Thread(target=send_audio, args=(sock, p, listen_own, player, audio_encryptor, compressor, mute, args.input_device), daemon=True)
-    send_thread.start()
-
-    receive_thread = threading.Thread(target=receive_audio, args=(sock, player, audio_encryptor, compressor), daemon=True)
-    receive_thread.start()
-
-    try:
-        send_thread.join()
-    except KeyboardInterrupt:
-        print("\n正在断开连接...")
-        try:
-            name_bytes = name.encode('utf-8')
-            if audio_encryptor:
-                encrypted_data = audio_encryptor.encrypt(name_bytes)
-                leave_packet = struct.pack('!B', MSG_TYPE_LEAVE) + struct.pack('!I', len(encrypted_data)) + encrypted_data
-            else:
-                leave_packet = struct.pack('!BI', MSG_TYPE_LEAVE, len(name_bytes)) + name_bytes
-            sock.sendall(leave_packet)
-        except Exception:
-            pass
-    finally:
-        player.stop()
-        sock.close()
-        p.terminate()
-        logger.info("已断开连接")
+    root = tk.Tk()
+    app = VoiceChatGUI(root, name_override=name_override)
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    root.mainloop()
 
 
 if __name__ == '__main__':

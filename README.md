@@ -23,10 +23,12 @@ OpenVoiceChat 是一个轻量级、低延迟的语音聊天解决方案，采用
 ## 功能特性
 
 ### 实时通信
-- 低延迟语音传输（基于TCP协议）
-- 音频抖动缓冲（Jitter Buffer）平滑网络波动
+- 低延迟语音传输（基于UDP + RUDP协议）
+- Opus 音频编解码器（32kbps，16kHz采样率），高质量低带宽
+- 音频抖动缓冲（Jitter Buffer）平滑网络波动（96帧 = 1.92s缓冲，首次填充480ms，恢复填充120ms）
 - 音频包超时丢弃机制（200ms），防止延迟累积
-- zlib音频压缩，减少带宽占用
+- 智能音量均衡：实际音量 = 用户音量设置 / 未静音活跃用户数，防止多用户同时说话时音量叠加
+- 降噪功能：RMS 门限降噪，用户可调节强度（0-100），默认关闭，在发送前处理
 
 ### 安全特性
 - **AES-256-GCM 加密传输**：所有音频数据端到端加密
@@ -34,16 +36,26 @@ OpenVoiceChat 是一个轻量级、低延迟的语音聊天解决方案，采用
 - **RSA-2048 公钥加密**：认证时加密密码传输
 - **设备指纹识别**：基于MAC、CPU、主板、BIOS的硬件指纹
 - **速率限制**：防止暴力破解（5次失败后封禁5分钟）
-- **心跳检测**：10秒超时自动断开，防止未授权连接
+- **心跳检测**：30秒超时自动断开，防止未授权连接
 - **Windows DPAPI**：安全存储本地密码
 - **服务器公钥指纹验证**：类似SSH的信任机制
 
 ### 管理功能
 - 实时在线用户监控
-- 封禁设备（Ban）- 基于硬件指纹永久封禁
+- 封禁设备（Ban）- 基于硬件指纹永久封禁，IP封禁7天自动过期
 - 解除封禁（Unban）
-- IP地址封禁（7天自动过期）
 - 查看封禁列表
+- 踢出用户（Kick）
+- 不合规硬件自动封禁：客户端缺少关键硬件指纹（MAC/CPU/主板/BIOS）时自动封禁
+
+### 文字聊天
+- 文字聊天与音频共用同一UDP端口，使用RUDP协议传输
+- 文本长度限制200字，所有人可见，显示格式为 `[用户名] 文本内容`
+- 消息在服务器解密，确保管理员可见
+- 悄悄话模式：使用 `/msg 用户名 内容` 向指定用户发送私密消息，服务器解密后定向加密发送给目标用户和管理员
+- 文字聊天可用性与语音一致：可选管理员加入后才可用（共用 `OVC_REQUIRE_ADMIN` 环境变量），服务器端双重校验
+- 全部文字消息在服务器端记录日志（`logs/chat.log`），管理员消息单独标记
+- 管理员也可以发送文字消息，与客户端功能一致
 
 ### 其他特性
 - 图形化界面 (Tkinter GUI)
@@ -53,17 +65,20 @@ OpenVoiceChat 是一个轻量级、低延迟的语音聊天解决方案，采用
 - 用户独立音量控制
 - 本地监听（听自己的声音）
 - 音频录制（可选，需用户同意）
+- 隐私协议弹窗（首次连接时显示设备指纹收集、管理员监听、免责声明）
+- 自动重连：连接断开后自动重连，指数退避（1s → 2s → 4s → ... 最大60s），手动断开不重连
 - 配置文件持久化
-- 已知服务器自动记忆
+- 已知服务器自动记忆（类似SSH known_hosts）
 - 支持打包为独立可执行文件
 - Docker 容器化部署（服务器端）
+- 服务器 RSA 密钥持久化（首次启动自动生成 `server_rsa_key.pem`）
 
 ## 系统架构
 
 ```mermaid
 graph LR
-    Client["👤 Client<br/>(GUI App)"] <-->|"TCP<br/>Port: 9090"| Server["🖧 Server<br/>(Backend)"]
-    Server <-->|"TCP<br/>Port: 9091"| Admin["👨‍💼 Admin<br/>(GUI App)"]
+    Client["👤 Client<br/>(GUI App)"] <-->|"UDP<br/>Port: 9090"| Server["🖧 Server<br/>(Backend)"]
+    Server <-->|"UDP<br/>Port: 9091"| Admin["👨‍💼 Admin<br/>(GUI App)"]
 
     classDef clientClass fill:#e1f5fe,stroke:#01579b,stroke-width:2px
     classDef serverClass fill:#fff3e0,stroke:#e65100,stroke-width:2px
@@ -78,8 +93,8 @@ graph LR
 
 | 端口 | 协议 | 用途 |
 |------|------|------|
-| 9090 | TCP | 客户端连接（认证+音频数据） |
-| 9091 | TCP | 管理员连接（认证+音频数据） |
+| 9090 | UDP | 客户端连接（认证+音频数据+文字聊天） |
+| 9091 | UDP | 管理员连接（认证+音频数据+文字聊天） |
 
 ## 技术栈
 
@@ -90,7 +105,28 @@ graph LR
 - **Tkinter**: 图形用户界面
 - **PyInstaller**: 可执行文件打包
 - **Docker**: 服务器容器化
-- **zlib**: 音频数据压缩
+- **Opus**: 音频编解码（libopus，32kbps 低延迟语音编码）
+- **RUDP**: 可靠UDP协议（自定义实现，用于控制消息和文字聊天）
+
+## 版本说明
+
+### 现有版本
+> 格式： `0.大版本.小版本.内部版本`
+发行版取前三段，即 `0.大版本.小版本`
+[](内部测试使用后三段加-test，即大版本.小版本-test)
+- **最新客户端版本**: 0.1.6
+- **最新管理员版本**: 0.1.6
+- **最新服务器版本**: 0.1.6
+> **注意**：服务器端与客户端和管理员端的小版本必须匹配，否则可能会导致连接失败。
+例如 0.1.6 的客户端、管理员端可以连接 0.1.6 的服务端。
+
+### 更新说明
+- **0.1.6 (2026-07-25)**：添加文字聊天功能（公聊/悄悄话，共用UDP端口），RMS降噪功能，智能音量均衡，JitterBuffer 恢复模式（防止短暂中断后burst-silence），服务器端文字聊天日志与管理门控，RUDP协议传输控制消息和文本，服务器文件日志（server.log + chat.log），修复新客户端连接时OS socket缓冲区积压导致的3秒音频延迟
+- **0.1.5 (2026-07-24)**：换用 Opus 编码器
+- **0.1.4 (2026-07-24)**：换用新的版本号格式： `0.大版本.小版本.内部版本`
+- **1.3.2 (2026-07-22)**: 修复服务器端在多个客户端连接时由于单线程处理导致的音频断断续续以及巨大延迟问题。
+- **1.3.1 (2026-07-22)**: 修复了部分敏感数据明文传输的漏洞。
+- **1.0.0 (2026-忘了-忘了)**: 初始版本，支持基本的语音聊天功能，但是有巨多bug以及安全漏洞。
 
 ## 快速开始
 
@@ -127,11 +163,14 @@ services:
       - OVC_RECORDING_DURATION=5
       - OVC_RECORDING_MAX_SIZE=10240
       - OVC_RECORDING_RETENTION=30
+      # 是否要求管理员在线才允许语音和文字聊天（默认 false）
+      - OVC_REQUIRE_ADMIN=false
     ports:
-      - "9090:9090/tcp"
-      - "9091:9091/tcp"
+      - "9090:9090/udp"
+      - "9091:9091/udp"
     volumes:
       - ./recordings:/app/recordings
+      - ./logs:/app/logs
     restart: unless-stopped
 ```
 
@@ -159,6 +198,17 @@ docker-compose logs -f
 docker-compose down
 ```
 
+#### 日志文件说明
+
+服务器会自动在 `logs/` 目录下生成两类日志文件（需在 `docker-compose.yml` 中挂载 `./logs:/app/logs`）：
+
+| 日志文件 | 说明 | 轮转策略 |
+|----------|------|----------|
+| `logs/server.log` | 服务器系统日志（认证、连接、错误等） | 10MB/文件，保留5个备份 |
+| `logs/chat.log` | 文字聊天日志（公聊、悄悄话、管理员消息） | 10MB/文件，保留5个备份 |
+
+> **注意**：`logs/` 目录通过 Docker volume 挂载到宿主机，日志文件在容器重启后不会丢失。文字聊天日志记录所有用户发送的消息内容，请妥善保管。
+
 **方式二：使用 docker 命令**
 
 ```bash
@@ -170,8 +220,8 @@ docker run -d \
   --name openvoicechat-server \
   -e OVC_PASSWORD=your_password_here \
   -e OVC_ADMIN_PASSWORD=your_admin_password_here \
-  -p 9090:9090/tcp \
-  -p 9091:9091/tcp \
+  -p 9090:9090/udp \
+  -p 9091:9091/udp \
   openvoicechat-server
 ```
 
@@ -190,7 +240,7 @@ docker run -d \
 | `OVC_RECORDING_DURATION` | ❌ | `5` | 单个录音文件时长（分钟） |
 | `OVC_RECORDING_MAX_SIZE` | ❌ | `10240` | 录音文件最大总大小（MB，默认10GB） |
 | `OVC_RECORDING_RETENTION` | ❌ | `30` | 录音文件保留天数（超过期限自动删除） |
-| `OVC_REQUIRE_ADMIN` | ❌ | `true` | 管理员离线时是否断开所有客户端（设为 `false` 允许无管理员独立运行） |
+| `OVC_REQUIRE_ADMIN` | ❌ | `false` | 管理员离线时是否断开所有客户端（设为 `true` 要求管理员在线才允许语音和文字聊天） |
 
 > **注意**：`OVC_PASSWORD` 和 `OVC_ADMIN_PASSWORD` 是必填项，未设置时服务器将拒绝启动。
 
@@ -255,6 +305,32 @@ python server/main.py
 
 > **注意**：从源码运行时，服务器需要访问项目根目录下的 `shared/` 模块，请确保从项目根目录启动，或保持目录结构完整。
 
+### 命令行参数
+
+**服务器端**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--log-level` | `INFO` | 日志级别：`DEBUG`、`INFO`、`WARNING`、`ERROR` |
+| `--log-dir` | `server/logs` | 日志文件存储目录 |
+
+**客户端**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--name` | 无 | 预设昵称（跳过GUI输入） |
+
+**管理端**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--host` | `127.0.0.1` | 服务器地址 |
+| `--admin-port` | `9091` | 管理员端口 |
+| `--name` | 无 | 管理员昵称 |
+| `--password` | 无 | 管理员密码 |
+| `--volume` | `1.0` | 播放音量 0.0-2.0 |
+| `--list-devices` | - | 列出所有音频设备后退出 |
+
 ### 打包为可执行文件
 
 使用 PyInstaller 打包应用程序：
@@ -278,14 +354,10 @@ python server/main.py
    - 验证服务器指纹
   
    > **注意**：首次连接时，务必验证服务器指纹。
-   >
-   > 指纹应当从可靠的、不可被篡改的渠道获得，如服务器官网或直接由管理员通过微信、QQ等社交软件告知。
-   >
-   > 获得的指纹只有前一部分，仅需对比客户端收到的指纹的前一部分即可。
-   >
-   > 若指纹不匹配，请不要连接，先向管理员确认你获得的指纹是否正确。若仍然不匹配，请不要连接，切换网络连接（如开启 VPN 或使用移动网络）进行尝试。只要指纹不匹配，就不能连接。
-   >
-   > 若连接指纹不匹配的服务器导致被中间人攻击，开发者概不负责。
+指纹应当从可靠的、不可被篡改的渠道获得，如服务器官网或直接由管理员通过微信、QQ等社交软件告知。
+获得的指纹只有前一部分，仅需对比客户端收到的指纹的前一部分即可。
+若指纹不匹配，请不要连接，先向管理员确认你获得的指纹是否正确。若仍然不匹配，请不要连接，切换网络连接（如开启 VPN 或使用移动网络）进行尝试。只要指纹不匹配，就不能连接。
+若连接指纹不匹配的服务器导致被中间人攻击，开发者概不负责。
 
    - **查看录音状态提示**：
      - 若服务器已开启录音：显示详细录音信息（目的、存储期限、方式、范围），需用户同意
@@ -316,19 +388,26 @@ python server/main.py
    - 点击"连接"按钮
 
 2. **监控功能**：
-   - 实时查看所有在线用户
+   - 实时查看所有在线用户（含设备ID、IP地址、硬件指纹）
    - 监听所有用户或指定用户的音频
    - 查看用户加入/离开事件
+   - 标签页切换：在线用户 / 封禁列表
 
 3. **管理操作**：
-   - **封禁设备**：点击用户昵称（列表最左边） → 封禁选中用户（基于硬件指纹，永久生效）
-   - **解除封禁**：在封禁列表中点击解除
+   - **封禁设备**：点击用户昵称 → 封禁选中用户（基于硬件指纹，永久生效；IP地址7天自动过期）
+   - **解除封禁**：在封禁列表标签页中点击"一键解封选中设备"
+   - **踢出用户**：点击用户昵称 → 踢出选中用户
    - **静音用户**：点击用户旁的"M"按钮，停止接收该用户音频
+   - **刷新封禁列表**：点击"刷新封禁列表"按钮
 
-4. **封禁列表**：
+4. **文字聊天**：
+   - 管理员也可以发送文字消息（公聊/悄悄话），与客户端功能一致
+   - 管理员能看到所有悄悄话的目标用户名称
+
+5. **封禁列表**：
    - 硬件指纹封禁：永久生效
    - IP地址封禁：7天后自动过期
-   - 查看封禁原因和时间
+   - 查看封禁原因、封禁管理员、关联昵称和IP
 
 ### 配置文件说明
 
@@ -422,121 +501,505 @@ volume: 1.0
 
 ### 项目结构
 
-```mermaid
-graph TD
-    Root["📁 OpenVoiceChat/"]
-
-    subgraph Shared["📦 shared/"]
-        SH_Const["📄 constants.py<br/>消息协议常量"]
-        SH_Crypto["📄 crypto.py<br/>AES-256-GCM 加密"]
-        SH_Audio["📄 audio_utils.py<br/>音频压缩/抖动缓冲"]
-        SH_Finger["📄 device_fingerprint.py<br/>设备指纹"]
-        SH_Security["📄 security_utils.py<br/>DPAPI/指纹验证"]
-    end
-
-    subgraph Server["🖧 server/"]
-        S_Main["📄 main.py<br/>服务器主程序"]
-        S_Req["📋 requirements.txt<br/>服务器依赖"]
-        S_Docker["🐳 Dockerfile<br/>Docker 配置"]
-        S_Ban["🚫 ban_list.json<br/>封禁列表"]
-        S_DevDB["🔍 device_fingerprints.json<br/>设备指纹库"]
-        S_Rec["📁 recordings/<br/>录音文件目录"]
-    end
-
-    subgraph Client["👤 client/"]
-        C_Main["📄 main.py<br/>客户端主程序"]
-        C_Config["⚙️ config.yaml<br/>客户端配置"]
-        C_Req["📋 requirements.txt<br/>客户端依赖"]
-        C_Servers["📋 known_servers.json<br/>已知服务器"]
-    end
-
-    subgraph Admin["👨‍💼 admin/"]
-        A_Main["📄 main.py<br/>管理员主程序"]
-        A_Config["⚙️ config_admin.yaml<br/>管理员配置"]
-        A_Req["📋 requirements.txt<br/>管理员依赖"]
-        A_Servers["📋 known_servers_admin.json<br/>已知服务器"]
-    end
-
-    subgraph Build["📦 dist/ & build/"]
-        B_Specs["📄 VoiceChatClient.spec<br/>📄 VoiceChatAdmin.spec<br/>PyInstaller 打包配置"]
-        B_ISS["📄 OpenVoiceChatClient.iss<br/>📄 OpenVoiceChatAdmin.iss<br/>Inno Setup 安装脚本"]
-        B_Output["📁 Output/<br/>安装包 .exe"]
-    end
-
-    Root --> Server
-    Root --> Client
-    Root --> Admin
-    Root --> Shared
-    Root --> Build
-
-    Shared --> SH_Const
-    Shared --> SH_Crypto
-    Shared --> SH_Audio
-    Shared --> SH_Finger
-    Shared --> SH_Security
-
-    Server --> S_Main
-    Server --> S_Req
-    Server --> S_Docker
-    Server --> S_Ban
-    Server --> S_DevDB
-    Server --> S_Rec
-
-    Client --> C_Main
-    Client --> C_Config
-    Client --> C_Req
-    Client --> C_Servers
-
-    Admin --> A_Main
-    Admin --> A_Config
-    Admin --> A_Req
-    Admin --> A_Servers
-
-    Build --> B_Specs
-    Build --> B_ISS
-    Build --> B_Output
-
-    classDef rootClass fill:#e3f2fd,stroke:#0d47a1,stroke-width:3px
-    classDef sharedClass fill:#e8eaf6,stroke:#283593,stroke-width:2px
-    classDef serverClass fill:#fff3e0,stroke:#e65100,stroke-width:2px
-    classDef clientClass fill:#e1f5fe,stroke:#01579b,stroke-width:2px
-    classDef adminClass fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
-    classDef buildClass fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
-    classDef fileClass fill:#fafafa,stroke:#757575,stroke-width:1px
-
-    class Root rootClass
-    class Shared sharedClass
-    class Server serverClass
-    class Client clientClass
-    class Admin adminClass
-    class Build buildClass
-    class SH_Const,SH_Crypto,SH_Audio,SH_Finger,SH_Security,S_Main,S_Req,S_Docker,S_Ban,S_DevDB,S_Rec,C_Main,C_Config,C_Req,C_Servers,A_Main,A_Config,A_Req,A_Servers,B_Specs,B_ISS,B_Output fileClass
+```
+OpenVoiceChat/
+├── shared/                         # 共享模块
+│   ├── __init__.py                  # 模块导出
+│   ├── constants.py                 # 消息协议常量
+│   ├── crypto.py                    # AES-256-GCM 加密 / Nonce 池
+│   ├── audio_utils.py               # Opus 压缩 / 抖动缓冲 / 音频播放
+│   ├── opus_utils.py                # Opus 编解码器封装
+│   ├── noise.py                     # RMS 降噪
+│   ├── rudp.py                      # 可靠 UDP 协议
+│   ├── device_fingerprint.py        # 设备指纹采集
+│   └── security_utils.py            # DPAPI 加密 / 指纹验证
+│
+├── server/                          # 服务器端
+│   ├── main.py                      # 服务器主程序
+│   ├── requirements.txt             # 服务器依赖
+│   ├── Dockerfile                   # Docker 镜像构建
+│   ├── server_rsa_key.pem           # RSA 密钥对（自动生成，首次启动时创建）
+│   ├── ban_list.json                # 封禁列表
+│   ├── device_fingerprints.json     # 设备指纹库
+│   ├── recordings/                  # 录音文件目录
+│   └── logs/                        # 日志文件目录（server.log + chat.log）
+│
+├── client/                          # 客户端
+│   ├── main.py                      # 客户端主程序 (GUI)
+│   ├── config.yaml                  # 客户端配置
+│   ├── requirements.txt             # 客户端依赖
+│   └── known_servers.json           # 已知服务器指纹
+│
+├── admin/                           # 管理员端
+│   ├── main.py                      # 管理员主程序 (GUI)
+│   ├── config_admin.yaml            # 管理员配置
+│   ├── requirements.txt             # 管理员依赖
+│   └── known_servers_admin.json     # 已知服务器指纹
+│
+├── VoiceChatClient.spec             # 客户端 PyInstaller 打包配置
+├── VoiceChatAdmin.spec              # 管理员 PyInstaller 打包配置
+├── dist/
+│   ├── OpenVoiceChatClient.iss      # 客户端 Inno Setup 安装脚本
+│   └── OpenVoiceChatAdmin.iss       # 管理员 Inno Setup 安装脚本
+├── docker-compose.yml               # Docker Compose 配置
+├── requirements.txt                 # 项目根依赖
+└── README.md                        # 项目文档
 ```
 
-### 消息协议
+| 模块 | 文件 | 说明 |
+|------|------|------|
+| 协议常量 | `shared/constants.py` | 所有消息类型常量、音频参数、缓冲区大小 |
+| 加密 | `shared/crypto.py` | AES-256-GCM 加解密、全局 Nonce 池 |
+| 音频 | `shared/audio_utils.py` | Opus 压缩/解压、JitterBuffer、AudioPlayer |
+| 编解码 | `shared/opus_utils.py` | Opus 编解码器跨平台封装 |
+| 降噪 | `shared/noise.py` | RMS 门限降噪（0-100 强度可调） |
+| 可靠UDP | `shared/rudp.py` | RUDP 协议实现（ACK/重传/去重） |
+| 设备指纹 | `shared/device_fingerprint.py` | 硬件指纹采集（MAC/CPU/主板/BIOS） |
+| 安全 | `shared/security_utils.py` | DPAPI 密码存储、服务器指纹验证 |
+| 服务器 | `server/main.py` | UDP 接收循环、认证、转发、管理 |
+| 客户端 | `client/main.py` | Tkinter GUI、音频采集/播放、聊天 |
+| 管理员 | `admin/main.py` | Tkinter GUI、监控面板、封禁管理 |
 
-系统使用自定义二进制协议进行通信：
+## 数据包规范
 
-| 消息类型 | 值 | 说明 |
-|----------|-----|------|
-| MSG_TYPE_JOIN | 1 | 客户端加入 |
-| MSG_TYPE_AUDIO | 2 | 音频数据包 |
-| MSG_TYPE_ADMIN_JOIN | 4 | 管理员加入 |
-| MSG_TYPE_USER_LIST | 5 | 用户列表 |
-| MSG_TYPE_USER_JOINED | 6 | 用户加入事件 |
-| MSG_TYPE_HEARTBEAT | 7 | 心跳包 |
-| MSG_TYPE_LEAVE | 8 | 用户离开 |
-| MSG_TYPE_AUTH_SUCCESS | 9 | 认证成功 |
-| MSG_TYPE_AUTH_FAIL | 10 | 认证失败 |
-| MSG_TYPE_ADMIN_BAN | 11 | 封禁设备 |
-| MSG_TYPE_ADMIN_KICK | 12 | 踢出用户 |
-| MSG_TYPE_BANNED | 13 | 设备被封禁 |
-| MSG_TYPE_ADMIN_GET_BAN_LIST | 14 | 获取封禁列表 |
-| MSG_TYPE_BAN_LIST | 15 | 封禁列表数据 |
-| MSG_TYPE_ADMIN_UNBAN | 16 | 解除封禁 |
-| MSG_TYPE_ADMIN_NOT_ONLINE | 17 | 管理员不在线 |
-| MSG_TYPE_RECORDING_NOTICE | 18 | 录音状态通知 |
-| MSG_TYPE_RECORDING_CONSENT | 19 | 客户端录音同意响应 |
+系统使用自定义二进制协议进行通信，分为三类：**RUDP 控制消息**、**音频数据包** 和 **文本消息**。
+
+所有消息均通过 UDP 传输。音频包使用原始 UDP（低延迟），控制消息和文本消息使用 RUDP 协议（可靠传输）。
+
+---
+
+### 一、RUDP 基础格式
+
+所有非音频消息均使用 RUDP（Reliable UDP）协议封装：
+
+```
+字节偏移 | 大小  | 字段         | 说明
+---------|-------|-------------|--------------------------
+0        | 1     | msg_type    | 消息类型（见下方消息类型表）
+1        | 2     | seq_num     | 序列号（大端序，0-65535循环）
+3        | 1     | flags       | 标志位（见下方标志说明）
+4        | 4     | payload_len | 负载长度（大端序，不含头部）
+8        | N     | payload     | 负载数据（长度由 payload_len 指定）
+```
+
+**RUDP 头部总长度：8 字节**
+
+**Flags 标志位：**
+
+| 值   | 常量               | 说明                               |
+|------|-------------------|------------------------------------|
+| 0x01 | NEEDS_ACK         | 发送方期望接收方回复 ACK            |
+| 0x02 | IS_ACK            | 此消息是一个 ACK 确认               |
+| 0x04 | IS_RESPONSE       | 此消息是对请求的响应                |
+
+**常见组合：**
+- `flags=0`：单向通知，无需确认（用于心跳、广播等）
+- `flags=0x01` (NEEDS_ACK)：请求，期望对方回复
+- `flags=0x03` (NEEDS_ACK | IS_ACK)：无效组合
+- `flags=0x05` (NEEDS_ACK | IS_RESPONSE)：响应，期望对方回复 ACK
+
+---
+
+### 二、音频数据包格式（MSG_TYPE_AUDIO = 2）
+
+音频包**不使用 RUDP 封装**，直接通过 UDP 发送以获得最低延迟。
+
+#### 客户端 → 服务器
+
+```
+字节偏移 | 大小  | 字段            | 说明
+---------|-------|----------------|--------------------------
+0        | 1     | msg_type       | 固定为 2 (MSG_TYPE_AUDIO)
+1        | 4     | user_id        | 发送者用户ID（大端序）
+5        | 8     | timestamp      | 发送时间戳（double，大端序，Unix秒）
+13       | 4     | encrypted_len  | 加密后音频数据长度（大端序）
+17       | N     | encrypted_data | AES-256-GCM 加密的 Opus 压缩音频
+```
+
+**加密前流程：** PCM(16bit, 16kHz, 单声道) → Opus编码(32kbps) → AES-256-GCM加密
+
+#### 服务器 → 客户端/管理员
+
+```
+字节偏移 | 大小  | 字段             | 说明
+---------|-------|-----------------|--------------------------
+0        | 1     | msg_type        | 固定为 2 (MSG_TYPE_AUDIO)
+1        | 4     | sender_id       | 发送者用户ID（大端序）
+5        | 1     | sender_name_len | 发送者昵称字节长度
+6        | N     | sender_name     | 发送者昵称（UTF-8）
+6+N      | 8     | timestamp       | 原始时间戳（double，大端序）
+14+N     | 4     | encrypted_len   | 重新加密后音频数据长度（大端序）
+18+N     | M     | encrypted_data  | 使用接收者会话密钥重新加密的音频
+```
+
+---
+
+### 三、消息类型总览
+
+| 类型 | 值  | 方向              | 说明               | 传输方式     |
+|------|-----|-------------------|--------------------|-------------|
+| MSG_TYPE_JOIN | 1 | C→S | 客户端加入请求 | RUDP(可靠) |
+| MSG_TYPE_AUDIO | 2 | C↔S↔C/A | 音频数据包 | UDP(原始) |
+| MSG_TYPE_ADMIN_JOIN | 4 | A→S | 管理员加入请求 | RUDP(可靠) |
+| MSG_TYPE_USER_LIST | 5 | S→C/A | 用户列表 | RUDP(广播) |
+| MSG_TYPE_USER_JOINED | 6 | S→C/A | 用户加入/离开事件 | RUDP(广播) |
+| MSG_TYPE_HEARTBEAT | 7 | C/A→S | 心跳包 | RUDP(单向) |
+| MSG_TYPE_LEAVE | 8 | C/A→S, S→C | 离开/踢出通知 | RUDP |
+| MSG_TYPE_AUTH_SUCCESS | 9 | S→C/A | 认证成功 | RUDP(可靠) |
+| MSG_TYPE_AUTH_FAIL | 10 | S→C/A | 认证失败 | RUDP(可靠) |
+| MSG_TYPE_ADMIN_BAN | 11 | A→S | 封禁设备命令 | RUDP(可靠) |
+| MSG_TYPE_ADMIN_KICK | 12 | A→S | 踢出用户命令 | RUDP(可靠) |
+| MSG_TYPE_BANNED | 13 | S→C | 设备被封禁通知 | RUDP |
+| MSG_TYPE_ADMIN_GET_BAN_LIST | 14 | A→S | 请求封禁列表 | RUDP(可靠) |
+| MSG_TYPE_BAN_LIST | 15 | S→A | 封禁列表数据 | RUDP(广播) |
+| MSG_TYPE_ADMIN_UNBAN | 16 | A→S | 解除封禁命令 | RUDP(可靠) |
+| MSG_TYPE_ADMIN_NOT_ONLINE | 17 | S→C | 管理员不在线通知 | RUDP |
+| MSG_TYPE_RECORDING_NOTICE | 18 | S→C | 录音状态通知 | RUDP |
+| MSG_TYPE_RECORDING_CONSENT | 19 | C→S | 客户端录音同意响应 | RUDP(单向) |
+| MSG_TYPE_UDP_PORT | 20 | (保留) | UDP端口通知 | - |
+| MSG_TYPE_ADMIN_ONLINE | 21 | S→C | 管理员上线通知 | RUDP(广播) |
+| MSG_TYPE_ADMIN_OFFLINE | 22 | S→C | 管理员下线通知 | RUDP(广播) |
+| MSG_TYPE_DUPLICATE_NAME | 23 | S→C | 昵称重复通知 | RUDP(可靠) |
+| MSG_TYPE_TEXT_CHAT | 24 | C/A→S | 发送文本消息 | RUDP(单向) |
+| MSG_TYPE_TEXT_MESSAGE | 25 | S→C/A | 广播文本消息 | RUDP(广播) |
+
+> 方向说明：C=客户端(Client)，A=管理员(Admin)，S=服务器(Server)
+
+---
+
+### 四、各消息详细格式
+
+#### 4.1 MSG_TYPE_JOIN (1) — 客户端加入
+
+**步骤1：客户端请求 RSA 公钥**
+```
+payload: 空（0字节）
+```
+服务器回复：`[pub_key_len(4)][public_key_bytes(N)]`（RUDP 响应）
+
+**步骤2：客户端发送认证信息**
+```
+字节偏移 | 大小  | 字段                  | 说明
+---------|-------|----------------------|--------------------------
+0        | 4     | name_len             | 昵称字节长度（UTF-8）
+4        | N     | name                 | 昵称（UTF-8，最大128字节）
+4+N      | 4     | encrypted_pwd_len    | RSA加密密码长度
+8+N      | M     | encrypted_password   | RSA-2048 OAEP 加密的密码
+8+N+M    | 4     | fingerprints_len     | 设备指纹JSON长度
+12+N+M   | K     | fingerprints_json    | 设备指纹JSON（UTF-8，最大1024字节）
+```
+
+**设备指纹 JSON 格式：**
+```json
+{
+  "mac": "mac地址哈希",
+  "cpu": "CPU ID哈希",
+  "motherboard": "主板序列号哈希",
+  "bios": "BIOS序列号哈希"
+}
+```
+
+#### 4.2 MSG_TYPE_ADMIN_JOIN (4) — 管理员加入
+
+格式与 MSG_TYPE_JOIN 完全相同，但使用管理员端口（9091）和 `ADMIN_PASSWORD` 验证。
+
+#### 4.3 MSG_TYPE_AUTH_SUCCESS (9) — 认证成功
+
+```
+字节偏移 | 大小  | 字段                   | 说明
+---------|-------|-----------------------|--------------------------
+0        | 32    | salt                  | PBKDF2 盐值
+32       | 12    | nonce                 | AES-GCM nonce
+44       | 16    | tag                   | AES-GCM 认证标签
+60       | 32    | encrypted_session_key | 加密的会话密钥
+92       | 4     | user_id               | 服务器分配的用户ID（大端序）
+```
+
+**会话密钥派生：** `PBKDF2-HMAC-SHA256(password, salt, 100000 iterations) → AES-256-GCM decrypt(session_key)`
+
+#### 4.4 MSG_TYPE_AUTH_FAIL (10) — 认证失败
+
+```
+payload: 空（0字节）
+```
+
+#### 4.5 MSG_TYPE_HEARTBEAT (7) — 心跳包
+
+```
+字节偏移 | 大小  | 字段            | 说明
+---------|-------|----------------|--------------------------
+0        | 4     | encrypted_len  | 加密数据长度
+4        | N     | encrypted_name | AES-256-GCM 加密的昵称（UTF-8）
+```
+
+心跳间隔：3秒，超时：30秒（服务器端）
+
+#### 4.6 MSG_TYPE_USER_LIST (5) — 用户列表
+
+```
+payload: AES-256-GCM 加密的 JSON 字符串
+```
+
+**客户端收到的解密后 JSON：**
+```json
+[{"id": 1, "name": "用户A"}, {"id": 2, "name": "用户B"}]
+```
+
+**管理员收到的解密后 JSON（含详细信息）：**
+```json
+[{
+  "id": 1,
+  "name": "用户A",
+  "ip": "192.168.1.100",
+  "fingerprints": {"mac": "abc123...", "cpu": "def456..."}
+}]
+```
+
+#### 4.7 MSG_TYPE_USER_JOINED (6) — 用户事件
+
+```
+payload: AES-256-GCM 加密的事件文本
+```
+
+解密后格式：`"{name} has joined"` 或 `"{name} has left"`
+
+#### 4.8 MSG_TYPE_LEAVE (8) — 离开/踢出
+
+```
+字节偏移 | 大小  | 字段            | 说明
+---------|-------|----------------|--------------------------
+0        | 4     | encrypted_len  | 加密数据长度
+4        | N     | encrypted_name | AES-256-GCM 加密的昵称（UTF-8）
+```
+
+当服务器踢出用户时，发送空 payload（0字节）。
+
+#### 4.9 MSG_TYPE_BANNED (13) — 设备被封禁
+
+```
+payload: 空（0字节）
+```
+
+#### 4.10 MSG_TYPE_ADMIN_BAN (11) — 封禁设备命令
+
+```
+字节偏移 | 大小  | 字段            | 说明
+---------|-------|----------------|--------------------------
+0        | 4     | encrypted_len  | 加密数据长度
+4        | N     | encrypted_json | AES-256-GCM 加密的 JSON
+```
+
+**解密后 JSON：**
+```json
+{"user_id": 1, "reason": "违规行为"}
+```
+
+#### 4.11 MSG_TYPE_ADMIN_KICK (12) — 踢出用户命令
+
+```
+字节偏移 | 大小  | 字段            | 说明
+---------|-------|----------------|--------------------------
+0        | 4     | encrypted_len  | 加密数据长度
+4        | N     | encrypted_json | AES-256-GCM 加密的 JSON
+```
+
+**解密后 JSON：**
+```json
+{"user_id": 1}
+```
+
+#### 4.12 MSG_TYPE_ADMIN_GET_BAN_LIST (14) — 请求封禁列表
+
+```
+字节偏移 | 大小  | 字段            | 说明
+---------|-------|----------------|--------------------------
+0        | 4     | encrypted_len  | 加密数据长度（通常为0）
+4        | N     | encrypted_data | AES-256-GCM 加密的数据（通常为空）
+```
+
+#### 4.13 MSG_TYPE_BAN_LIST (15) — 封禁列表数据
+
+```
+payload: AES-256-GCM 加密的 JSON 数组
+```
+
+**解密后 JSON 数组元素格式：**
+```json
+{
+  "device_id": "唯一标识",
+  "fingerprints": [{"type": "mac", "value": "abc123...", "value_short": "abc123...", "reason": "", "expires_at": ""}],
+  "names": ["关联昵称"],
+  "ips": ["关联IP"],
+  "banned_at": "ISO时间戳",
+  "first_banned": "ISO时间戳",
+  "banned_by": "管理员名",
+  "reason": "原因",
+  "expires_at": "过期时间（IP封禁）或空（永久）"
+}
+```
+
+#### 4.14 MSG_TYPE_ADMIN_UNBAN (16) — 解除封禁命令
+
+```
+字节偏移 | 大小  | 字段            | 说明
+---------|-------|----------------|--------------------------
+0        | 4     | encrypted_len  | 加密数据长度
+4        | N     | encrypted_json | AES-256-GCM 加密的 JSON
+```
+
+**解密后 JSON：**
+```json
+{"device_key": "封禁设备唯一标识"}
+```
+
+#### 4.15 MSG_TYPE_ADMIN_NOT_ONLINE (17) — 管理员不在线
+
+```
+payload: 空（0字节）
+```
+
+#### 4.16 MSG_TYPE_ADMIN_ONLINE (21) / MSG_TYPE_ADMIN_OFFLINE (22)
+
+```
+payload: 空（0字节）
+```
+
+当 `OVC_REQUIRE_ADMIN=true` 时，管理员上下线会广播给所有客户端。客户端收到后启用/禁用语音发送和文字聊天。
+
+#### 4.17 MSG_TYPE_DUPLICATE_NAME (23) — 昵称重复
+
+```
+payload: 空（0字节）
+```
+
+#### 4.18 MSG_TYPE_RECORDING_NOTICE (18) — 录音状态通知
+
+```
+payload: AES-256-GCM 加密的二进制数据
+```
+
+**解密后格式：**
+```
+字节偏移 | 大小  | 字段            | 说明
+---------|-------|----------------|--------------------------
+0        | 1     | enabled        | 0=未开启, 1=已开启
+1        | 4     | purpose_len    | 录音目的文本长度
+5        | N     | purpose        | 录音目的（UTF-8）
+5+N      | 4     | duration_min   | 单个录音文件时长（分钟）
+9+N      | 4     | max_size_mb    | 录音总大小限制（MB）
+```
+
+#### 4.19 MSG_TYPE_RECORDING_CONSENT (19) — 录音同意响应
+
+```
+字节偏移 | 大小  | 字段     | 说明
+---------|-------|---------|--------------------------
+0        | 1     | consent | 0=拒绝, 1=同意
+```
+
+#### 4.20 MSG_TYPE_TEXT_CHAT (24) — 发送文本消息
+
+```
+payload: AES-256-GCM 加密的 UTF-8 文本
+```
+
+**解密后格式：** 纯文本 UTF-8 字符串，最大 200 字符。
+
+**普通消息：** 任意文本，服务器广播为 `[用户名] 文本内容`
+
+**悄悄话：** 以 `/msg 用户名 内容` 开头，服务器解析后定向发送：
+- 发送给目标用户：`[发送者 → you] 内容`
+- 发送给所有管理员：`[发送者 → 目标用户] 内容`
+- 发送给发送者确认：`[You → 目标用户] 内容`
+
+#### 4.21 MSG_TYPE_TEXT_MESSAGE (25) — 广播文本消息
+
+```
+payload: AES-256-GCM 加密的 UTF-8 文本
+```
+
+**解密后格式：** 已格式化的 UTF-8 字符串，可直接显示。
+
+**显示格式：**
+- 普通消息：`[用户名] 文本内容`
+- 悄悄话（目标用户）：`[发送者 → you] 内容`
+- 悄悄话（管理员）：`[发送者 → 目标用户] 内容`
+- 悄悄话（发送者确认）：`[You → 目标用户] 内容`
+- 系统消息：`[System] 提示内容`
+
+---
+
+### 五、加密体系
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    认证阶段（RSA-2048）                    │
+│  客户端密码 ──RSA公钥加密──▶ 服务器 ──RSA私钥解密──▶ 验证  │
+└─────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────┐
+│                  会话密钥派生（PBKDF2）                    │
+│  password + salt ──PBKDF2-HMAC-SHA256(100k次)──▶ 密钥    │
+│  服务器生成随机 session_key ──AES-256-GCM加密──▶ 客户端    │
+└─────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────┐
+│                 数据传输（AES-256-GCM）                    │
+│  客户端 ──session_key加密──▶ 服务器 ──解密──▶             │
+│  服务器 ──接收者session_key重新加密──▶ 接收者              │
+│  Nonce池：全局共享，每次加密使用新 nonce                   │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 六、音频数据处理流程
+
+```
+发送端（客户端）：
+  麦克风 ──PCM──▶ 降噪(RMS门限) ──▶ 增益调节 ──▶ Opus编码(32kbps)
+  ──▶ AES-256-GCM加密 ──▶ UDP发送
+
+服务器：
+  UDP接收 ──▶ AES-256-GCM解密 ──▶ 录音(可选) ──▶
+  ──▶ 接收者session_key重新加密 ──▶ UDP转发
+
+接收端（客户端/管理员）：
+  UDP接收 ──▶ AES-256-GCM解密 ──▶ Opus解码 ──▶
+  ──▶ 音量均衡 ──▶ 抖动缓冲 ──▶ 音频播放
+```
+
+---
+
+### 七、连接建立流程
+
+```
+客户端                          服务器                         管理员
+  │                               │                               │
+  │──── RUDP: JOIN(空)──────────▶│                               │
+  │◀─── RUDP: RSA公钥 ───────────│                               │
+  │                               │                               │
+  │──── RUDP: JOIN(加密认证) ────▶│                               │
+  │         (RSA加密密码+指纹)     │                               │
+  │                               │── 验证密码 + 检查封禁           │
+  │                               │── 派生会话密钥                  │
+  │◀─── RUDP: AUTH_SUCCESS ──────│                               │
+  │       (加密的session_key)     │                               │
+  │                               │                               │
+  │◀─── RUDP: RECORDING_NOTICE ──│                               │
+  │                               │                               │
+  │◀─── RUDP: ADMIN_ONLINE/OFFLINE│                              │
+  │                               │                               │
+  │──── UDP: AUDIO ──────────────▶│──── UDP: AUDIO ──────────────▶│
+  │◀─── UDP: AUDIO ──────────────│◀─── UDP: AUDIO ──────────────│
+  │                               │                               │
+  │──── RUDP: TEXT_CHAT ─────────▶│──── RUDP: TEXT_MESSAGE ──────▶│
+  │◀─── RUDP: TEXT_MESSAGE ──────│◀─── RUDP: TEXT_MESSAGE ──────│
+  │                               │                               │
+  │──── RUDP: HEARTBEAT(3s) ─────▶│◀─── RUDP: HEARTBEAT(3s) ─────│
+```
 
 ## AI声明
 

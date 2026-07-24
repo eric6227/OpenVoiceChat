@@ -6,13 +6,13 @@ import logging
 import time
 import os
 import hashlib
-import getpass
 import argparse
 import yaml
 import ctypes
 import ctypes.wintypes
 import json
 import array
+import queue
 
 # Ensure the project root is in sys.path so shared module can be imported
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,12 +31,8 @@ except ImportError:
     print("错误: 请先安装 pycryptodome: pip install pycryptodome")
     sys.exit(1)
 
-try:
-    import tkinter as tk
-    from tkinter import ttk, messagebox, scrolledtext, simpledialog
-    HAS_GUI = True
-except ImportError:
-    HAS_GUI = False
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext, simpledialog
 
 from shared import (
     get_device_fingerprint,
@@ -48,12 +44,16 @@ from shared import (
     MSG_TYPE_LEAVE, MSG_TYPE_AUTH_SUCCESS, MSG_TYPE_AUTH_FAIL,
     MSG_TYPE_ADMIN_BAN, MSG_TYPE_BANNED,
     MSG_TYPE_ADMIN_GET_BAN_LIST, MSG_TYPE_BAN_LIST, MSG_TYPE_ADMIN_UNBAN,
+    MSG_TYPE_ADMIN_KICK,
+    MSG_TYPE_TEXT_CHAT, MSG_TYPE_TEXT_MESSAGE,
+    MSG_TYPE_UDP_PORT, UDP_AUDIO_PORT,
     JITTER_BUFFER_SIZE, MAX_PACKET_SIZE,
     init_audio_format,
     encrypt_password_dpapi, decrypt_password_dpapi,
     load_known_servers, save_known_servers,
     compute_server_fingerprint, verify_server_fingerprint,
 )
+from shared.rudp import RUDPEndpoint, pack_rudp_message, unpack_rudp_message
 
 init_audio_format(pyaudio)
 FORMAT = pyaudio.paInt16
@@ -81,104 +81,6 @@ def send_heartbeat(sock, server_addr, name, is_admin=False, encryptor=None):
             time.sleep(heartbeat_interval)
 
 
-def receive_audio(sock, player: AudioPlayer, encryptor: SessionKeyEncryptor, compressor: AudioCompressor):
-    """Receive encrypted audio from server via TCP, decrypt, decompress, and play."""
-    logger.info("Starting to receive audio (monitoring mode)...")
-    packet_count = 0
-    buffer = b''
-    
-    while True:
-        try:
-            data = sock.recv(MAX_PACKET_SIZE)
-            if not data:
-                logger.warning("Server disconnected")
-                break
-            
-            buffer += data
-            
-            while len(buffer) >= 1:
-                msg_type = struct.unpack('!B', buffer[:1])[0]
-                
-                if msg_type == MSG_TYPE_AUDIO:
-                    # Format: [msg_type(1)][timestamp(8)][encrypted_len(4)][encrypted_audio]
-                    if len(buffer) < 13:  # 1 + 8 + 4
-                        break
-                    
-                    timestamp = struct.unpack('!d', buffer[1:9])[0]
-                    encrypted_len = struct.unpack('!I', buffer[9:13])[0]
-                    
-                    if len(buffer) < 13 + encrypted_len:
-                        break
-                    
-                    encrypted_data = buffer[13:13+encrypted_len]
-                    buffer = buffer[13+encrypted_len:]
-                    
-                    packet_count += 1
-                    if packet_count <= 3:
-                        logger.info(f"收到第 {packet_count} 个音频包，大小: {len(encrypted_data)}")
-                    
-                    compressed_data = encryptor.decrypt(encrypted_data)
-                    if compressed_data is None:
-                        if packet_count <= 3:
-                            logger.warning("警告: 解密失败")
-                        continue
-                    if packet_count <= 3:
-                        logger.info(f"解密成功，压缩数据大小: {len(compressed_data)}")
-                    if compressed_data and compressor:
-                        pcm_data = compressor.decompress(compressed_data)
-                        if packet_count <= 3:
-                            logger.info(f"解压成功，PCM数据大小: {len(pcm_data)}")
-                        if player:
-                            player.push(pcm_data)
-                elif msg_type == MSG_TYPE_USER_LIST:
-                    # Format: [msg_type(1)][encrypted_len(4)][encrypted_data]
-                    if len(buffer) < 5:
-                        break
-                    encrypted_len = struct.unpack('!I', buffer[1:5])[0]
-                    if len(buffer) < 5 + encrypted_len:
-                        break
-                    encrypted_data = buffer[5:5+encrypted_len]
-                    buffer = buffer[5+encrypted_len:]
-                    decrypted_data = encryptor.decrypt(encrypted_data)
-                    if decrypted_data:
-                        user_list = decrypted_data.decode('utf-8')
-                        print(f"\n[Online Users] {user_list}\n")
-                elif msg_type == MSG_TYPE_USER_JOINED:
-                    # Format: [msg_type(1)][encrypted_len(4)][encrypted_data]
-                    if len(buffer) < 5:
-                        break
-                    encrypted_len = struct.unpack('!I', buffer[1:5])[0]
-                    if len(buffer) < 5 + encrypted_len:
-                        break
-                    encrypted_data = buffer[5:5+encrypted_len]
-                    buffer = buffer[5+encrypted_len:]
-                    decrypted_data = encryptor.decrypt(encrypted_data)
-                    if decrypted_data:
-                        event = decrypted_data.decode('utf-8')
-                        print(f"\n[User Joined] {event}\n")
-                elif msg_type == MSG_TYPE_BAN_LIST:
-                    # Format: [msg_type(1)][encrypted_len(4)][encrypted_data]
-                    if len(buffer) < 5:
-                        break
-                    encrypted_len = struct.unpack('!I', buffer[1:5])[0]
-                    if len(buffer) < 5 + encrypted_len:
-                        break
-                    encrypted_data = buffer[5:5+encrypted_len]
-                    buffer = buffer[5+encrypted_len:]
-                    decrypted_data = encryptor.decrypt(encrypted_data)
-                    if decrypted_data:
-                        ban_list_json = decrypted_data.decode('utf-8')
-                        print(f"\n[Ban List Updated] {ban_list_json}\n")
-                else:
-                    buffer = buffer[1:]
-        except ConnectionResetError:
-            logger.warning("Connection reset by server")
-            break
-        except Exception as e:
-            logger.error(f"Error receiving audio: {e}")
-            time.sleep(0.1)
-
-
 class AdminGUI:
     """Main GUI class for the voice chat admin."""
     def __init__(self, root):
@@ -186,18 +88,21 @@ class AdminGUI:
         self.root.title("Open Voice Chat Admin")
         self.root.resizable(True, True)
         
-        # Automatically set window size to 1/3 width and 2/3 height of screen
+        # Automatically set window size to 1/3 width and 3/4 height of screen
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
         window_width = screen_width // 3
-        window_height = screen_height * 2 // 3
+        window_height = screen_height * 3 // 4
         self.root.geometry(f"{window_width}x{window_height}")
         
         self.connected = False
         self.running = False
         
-        self.sock_audio = None
-        self.sock_signal = None
+        self.sock_audio = None  # Will be replaced by udp_sock
+        self.sock_signal = None  # No longer used
+        self.udp_sock = None  # Single UDP socket for all communication
+        self.rudp_endpoint = None  # RUDP endpoint for reliable control messages
+        self.server_addr = None  # (host, port) of server's UDP port
         self.player = None
         self.p = None
         self.encryptor = None
@@ -210,7 +115,11 @@ class AdminGUI:
         self.user_id_map = {}  # Maps user_id -> user_name for display
         self.my_user_id = None  # Own user_id assigned by server
         self.muted_users = set()  # Set of user_ids that are muted
+        self.last_packet_time = 0  # Timestamp of last received packet
+        self._auto_reconnect = True  # Auto-reconnect on server disconnect
+        self._reconnect_params = None  # (host, port, name, password, volume) for reconnection
         self.monitoring_user_id = None  # None means monitor all, otherwise specific user_id
+        self._packet_queue = None  # Queue for decoupling recv from processing
         
         # Threading protection
         self._connect_lock = False  # Prevent rapid connect/disconnect clicks
@@ -289,7 +198,7 @@ class AdminGUI:
         logger.info(f"First connection to {server_addr}")
         logger.info(f"Server public key fingerprint: {fingerprint}")
         
-        if HAS_GUI and self.root and self.root.winfo_exists():
+        if self.root and self.root.winfo_exists():
             if not self._show_privacy_dialog():
                 logger.warning("User rejected privacy agreement, connection aborted")
                 return False
@@ -302,11 +211,6 @@ class AdminGUI:
             self._save_known_servers()
             logger.info(f"Server fingerprint saved for {server_addr}")
             return True
-        
-        logger.warning("CLI mode: auto-accepting server fingerprint")
-        self.known_servers[server_addr] = fingerprint
-        self._save_known_servers()
-        return True
     
     def _show_privacy_dialog(self) -> bool:
         """Show privacy agreement dialog (must be called from main thread)."""
@@ -438,40 +342,23 @@ class AdminGUI:
         users_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         users_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # Column widths in pixels
-        col_username = 120
-        col_s = 40
-        col_m = 40
-        col_device = 100
-        col_ip = 120
-        col_fp = 250
-        
-        # Configure scroll frame columns
-        self.users_scroll_frame.columnconfigure(0, minsize=col_username, weight=0)
-        self.users_scroll_frame.columnconfigure(1, minsize=col_s, weight=0)
-        self.users_scroll_frame.columnconfigure(2, minsize=col_m, weight=0)
-        self.users_scroll_frame.columnconfigure(3, minsize=col_device, weight=0)
-        self.users_scroll_frame.columnconfigure(4, minsize=col_ip, weight=0)
-        self.users_scroll_frame.columnconfigure(5, minsize=col_fp, weight=0)
-        
-        # Store column widths and starting row for user data
-        self._col_widths = (col_username, col_s, col_m, col_device, col_ip, col_fp)
-        self._user_row_start = 1  # Row 0 is header
-        
-        # Header row (row 0 in scrollable frame)
-        ttk.Label(self.users_scroll_frame, text="用户", font=('', 9, 'bold'), anchor=tk.W).grid(row=0, column=0, sticky=tk.W, padx=(5, 0), pady=2)
-        ttk.Label(self.users_scroll_frame, text="S", font=('', 9, 'bold'), anchor=tk.CENTER).grid(row=0, column=1, sticky=tk.EW, padx=2, pady=2)
-        ttk.Label(self.users_scroll_frame, text="M", font=('', 9, 'bold'), anchor=tk.CENTER).grid(row=0, column=2, sticky=tk.EW, padx=2, pady=2)
-        ttk.Label(self.users_scroll_frame, text="音量", font=('', 9, 'bold'), anchor=tk.CENTER).grid(row=0, column=3, padx=2, pady=2)
-        ttk.Label(self.users_scroll_frame, text="", font=('', 9, 'bold'), anchor=tk.CENTER).grid(row=0, column=4, padx=2, pady=2)
-        ttk.Label(self.users_scroll_frame, text="设备ID", font=('', 9, 'bold'), anchor=tk.W).grid(row=0, column=5, sticky=tk.W, padx=5, pady=2)
-        ttk.Label(self.users_scroll_frame, text="IP地址", font=('', 9, 'bold'), anchor=tk.W).grid(row=0, column=6, sticky=tk.W, padx=5, pady=2)
-        ttk.Label(self.users_scroll_frame, text="硬件指纹", font=('', 9, 'bold'), anchor=tk.W).grid(row=0, column=7, sticky=tk.W, padx=5, pady=2)
+        # Header row (uses pack, same as user rows)
+        header_frame = ttk.Frame(self.users_scroll_frame)
+        header_frame.pack(fill=tk.X, pady=2, padx=2)
+        ttk.Label(header_frame, text="用户", font=('', 9, 'bold'), width=12, anchor=tk.W).pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Label(header_frame, text="S", font=('', 9, 'bold'), width=2).pack(side=tk.LEFT, padx=2)
+        ttk.Label(header_frame, text="M", font=('', 9, 'bold'), width=2).pack(side=tk.LEFT, padx=2)
+        ttk.Label(header_frame, text="音量", font=('', 9, 'bold'), width=4).pack(side=tk.LEFT, padx=2)
+        ttk.Label(header_frame, text="", font=('', 9, 'bold'), width=3).pack(side=tk.LEFT, padx=2)
+        ttk.Label(header_frame, text="设备ID", font=('', 9, 'bold'), width=18, anchor=tk.W).pack(side=tk.LEFT, padx=5)
+        ttk.Label(header_frame, text="IP地址", font=('', 9, 'bold'), width=15, anchor=tk.W).pack(side=tk.LEFT, padx=5)
+        ttk.Label(header_frame, text="硬件指纹", font=('', 9, 'bold'), anchor=tk.W).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         
         # Track solo and mute states
         self.solo_users = set()
         self.muted_users = set()
         self.user_volumes = {}  # Volume per user_id: {user_id: volume_value}
+        self._active_audio_users = {}  # user_id -> last_audio_time for volume normalization
         self.user_buttons = {}  # Store button references
         self.selected_user_id = None
         
@@ -481,6 +368,9 @@ class AdminGUI:
         
         self.ban_btn = ttk.Button(ban_frame, text="封禁选中用户", command=self._ban_selected_user, state=tk.DISABLED)
         self.ban_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.kick_btn = ttk.Button(ban_frame, text="踢出选中用户", command=self._kick_selected_user, state=tk.DISABLED)
+        self.kick_btn.pack(side=tk.LEFT, padx=5)
         
         self.selected_user_var = tk.StringVar(value="未选择用户")
         ttk.Label(ban_frame, textvariable=self.selected_user_var).pack(side=tk.LEFT, padx=10)
@@ -544,11 +434,28 @@ class AdminGUI:
         self.selected_ban_var = tk.StringVar(value="未选择设备")
         ttk.Label(unban_frame, textvariable=self.selected_ban_var).pack(side=tk.LEFT, padx=10)
         
-        # Log frame
-        log_frame = ttk.LabelFrame(main_frame, text="日志", padding="10")
-        log_frame.pack(fill=tk.BOTH, expand=True)
+        # Text chat frame
+        chat_frame = ttk.LabelFrame(main_frame, text="文字聊天", padding="10")
+        chat_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=10, state=tk.DISABLED, wrap=tk.WORD)
+        self.chat_text = scrolledtext.ScrolledText(chat_frame, height=8, state=tk.DISABLED, wrap=tk.WORD)
+        self.chat_text.pack(fill=tk.BOTH, expand=True)
+        
+        chat_input_frame = ttk.Frame(chat_frame)
+        chat_input_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        self.chat_input = ttk.Entry(chat_input_frame)
+        self.chat_input.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        self.chat_input.bind("<Return>", self._send_text_message)
+        
+        self.chat_send_btn = ttk.Button(chat_input_frame, text="发送", command=self._send_text_message)
+        self.chat_send_btn.pack(side=tk.RIGHT)
+        
+        # Log frame (reduced height for chat)
+        log_frame = ttk.LabelFrame(main_frame, text="日志", padding="10")
+        log_frame.pack(fill=tk.BOTH, expand=False)
+        
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=2, state=tk.DISABLED, wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True)
         
     def _update_volume_label(self, *args):
@@ -595,124 +502,146 @@ class AdminGUI:
         self.log_text.config(state=tk.DISABLED)
         
     def _update_users(self, message):
-        """Update the online users list display."""
-        # Parse user list from message: "Users: [ID:1] user1 [Device:xxx] [IP:xxx] [FP:xxx], [ID:2] user2 ..."
-        self.user_id_map.clear()
-        self.user_buttons.clear()
+        """Update the online users list display incrementally.
         
-        # Clear scroll frame (keep header at row 0)
-        for widget in self.users_scroll_frame.winfo_children():
-            info = widget.grid_info()
-            if info and info.get('row', 0) > 0:
-                widget.destroy()
-        
-        if message.startswith("Users: "):
-            users_str = message[7:]
-            # Split by ", [ID:" to get each user
-            users = [u.strip() for u in users_str.split(", [ID:") if u.strip()]
-            if users and not users[0].startswith("[ID:"):
-                # First user doesn't have the split prefix
-                users[0] = "[ID:" + users[0]
+        Only adds new users and removes departed users. Users that
+        remain unchanged are not refreshed, preventing UI flicker.
+        """
+        try:
+            new_user_list = json.loads(message)
+            new_ids = set()
+            new_user_data = {}
             
-            row_idx = self._user_row_start
-            for user in users:
-                if not user.startswith("[ID:"):
-                    continue
-                    
+            # Build new user set
+            for user in new_user_list:
+                user_id = user["id"]
+                new_ids.add(user_id)
+                new_user_data[user_id] = user
+            
+            # Get current user IDs (excluding self from display set)
+            old_ids = set(self.user_id_map.keys())
+            if self.my_user_id is not None:
+                old_ids.discard(self.my_user_id)
+                new_ids.discard(self.my_user_id)
+            
+            # Remove departed users
+            removed_ids = old_ids - new_ids
+            for user_id in removed_ids:
+                if user_id in self.user_buttons:
+                    buttons = self.user_buttons[user_id]
+                    if "row_frame" in buttons:
+                        try:
+                            buttons["row_frame"].destroy()
+                        except Exception:
+                            pass
+                    del self.user_buttons[user_id]
+                if user_id in self.user_id_map:
+                    del self.user_id_map[user_id]
+            
+            # Add new users
+            added_ids = new_ids - old_ids
+            for user_id in added_ids:
+                user = new_user_data[user_id]
+                username = user["name"]
+                self.user_id_map[user_id] = username
+                self._add_user_row(user_id, user)
+            
+            # Update user_id_map with latest names
+            self.user_id_map.clear()
+            for user_id, user in new_user_data.items():
+                self.user_id_map[user_id] = user["name"]
+            
+            # Show/hide "no users" label
+            has_visible_users = any(
+                uid != self.my_user_id for uid in self.user_id_map
+            ) if self.user_id_map else False
+            self._update_empty_label(has_visible_users)
+            
+        except Exception:
+            ttk.Label(self.users_scroll_frame, text=message, foreground="gray").pack(pady=10)
+    
+    def _clear_user_list(self):
+        """Clear all user rows from the display."""
+        for user_id in list(self.user_buttons.keys()):
+            buttons = self.user_buttons[user_id]
+            if "row_frame" in buttons:
                 try:
-                    end_bracket = user.index("]")
-                    user_id = int(user[4:end_bracket])
-                    rest = user[end_bracket+1:].strip()
-                    
-                    # Parse username
-                    if '[' in rest:
-                        username = rest[:rest.index('[')].strip()
-                    else:
-                        username = rest
-                    
-                    self.user_id_map[user_id] = username
-                    
-                    # Skip self from display
-                    if self.my_user_id is not None and user_id == self.my_user_id:
-                        continue
-                    
-                    # Extract device ID, IP, and fingerprint
-                    device_id = ""
-                    ip_addr = ""
-                    fingerprint = ""
-                    
-                    # Parse [Device:xxx]
-                    if '[Device:' in rest:
-                        dev_start = rest.index('[Device:') + 8
-                        dev_end = rest.index(']', dev_start)
-                        device_id = rest[dev_start:dev_end]
-                    
-                    # Parse [IP:xxx]
-                    if '[IP:' in rest:
-                        ip_start = rest.index('[IP:') + 4
-                        ip_end = rest.index(']', ip_start)
-                        ip_addr = rest[ip_start:ip_end]
-                    
-                    # Parse [FP:xxx]
-                    if '[FP:' in rest:
-                        fp_start = rest.index('[FP:') + 4
-                        fp_end = rest.index(']', fp_start)
-                        fingerprint = rest[fp_start:fp_end]
-                    
-                    # Place widgets directly on scroll_frame using grid for alignment
-                    # Username label (clickable for selection)
-                    name_label = tk.Label(self.users_scroll_frame, text=username, anchor=tk.W, cursor="hand2")
-                    name_label.grid(row=row_idx, column=0, sticky=tk.W, padx=(5, 0), pady=1)
-                    name_label.bind('<Button-1>', lambda e, uid=user_id, uname=username: self._select_user(uid, uname))
-                    
-                    # Solo button
-                    solo_active = user_id in self.solo_users
-                    solo_bg = "#228B22" if solo_active else "#90EE90"
-                    solo_btn = tk.Button(self.users_scroll_frame, text="S", bg=solo_bg, width=3, height=1,
-                                       command=lambda uid=user_id, uname=username: self._toggle_solo(uid, uname))
-                    solo_btn.grid(row=row_idx, column=1, sticky=tk.EW, padx=2, pady=1)
-                    
-                    # Mute button
-                    mute_active = user_id in self.muted_users
-                    mute_bg = "#CC0000" if mute_active else "#FFB6C1"
-                    mute_btn = tk.Button(self.users_scroll_frame, text="M", bg=mute_bg, width=3, height=1,
-                                       command=lambda uid=user_id, uname=username: self._toggle_mute(uid, uname))
-                    mute_btn.grid(row=row_idx, column=2, sticky=tk.EW, padx=2, pady=1)
-                    
-                    # Volume slider
-                    user_volume = self.user_volumes.get(user_id, 1.0)
-                    volume_var = tk.DoubleVar(value=user_volume)
-                    volume_scale = ttk.Scale(self.users_scroll_frame, from_=0.0, to=2.0, variable=volume_var, orient=tk.HORIZONTAL)
-                    volume_scale.grid(row=row_idx, column=3, padx=2, pady=1)
-                    volume_label = ttk.Label(self.users_scroll_frame, text=f"{user_volume:.1f}", width=3)
-                    volume_label.grid(row=row_idx, column=4, padx=2, pady=1)
-                    volume_var.trace('w', lambda *args, uid=user_id, uname=username: self._on_user_volume_change(uid, uname))
-                    
-                    # Device ID label
-                    ttk.Label(self.users_scroll_frame, text=device_id, anchor=tk.W).grid(row=row_idx, column=5, sticky=tk.W, padx=5, pady=1)
-                    
-                    # IP address label
-                    ttk.Label(self.users_scroll_frame, text=ip_addr, anchor=tk.W).grid(row=row_idx, column=6, sticky=tk.W, padx=5, pady=1)
-                    
-                    # Fingerprint label
-                    ttk.Label(self.users_scroll_frame, text=fingerprint, anchor=tk.W).grid(row=row_idx, column=7, sticky=tk.W, padx=5, pady=1)
-                    
-                    # Store button references
-                    self.user_buttons[user_id] = {
-                        "solo": solo_btn, 
-                        "mute": mute_btn, 
-                        "name_label": name_label,
-                        "volume_var": volume_var,
-                        "volume_scale": volume_scale,
-                        "volume_label": volume_label
-                    }
-                    
-                    row_idx += 1
-                    
-                except (ValueError, IndexError):
+                    buttons["row_frame"].destroy()
+                except Exception:
                     pass
-        else:
-            ttk.Label(self.users_scroll_frame, text=message, foreground="gray").grid(row=self._user_row_start, column=0, columnspan=8, pady=10)
+        self.user_buttons.clear()
+        self.user_id_map.clear()
+        self._update_empty_label(False)
+    
+    def _add_user_row(self, user_id, user):
+        """Add a single user row to the admin display."""
+        username = user["name"]
+        ip_addr = user.get("ip", "")
+        fingerprints = user.get("fingerprints", {})
+        device_id = fingerprints.get("mac", "")[:16] if fingerprints.get("mac") else ""
+        fingerprint = ", ".join(f"{k}: {v}" for k, v in fingerprints.items())
+        
+        row_frame = ttk.Frame(self.users_scroll_frame)
+        row_frame.pack(fill=tk.X, pady=1, padx=2)
+        
+        # Username label (clickable for selection)
+        name_label = tk.Label(row_frame, text=username, anchor=tk.W, cursor="hand2", width=12)
+        name_label.pack(side=tk.LEFT, padx=(5, 0))
+        name_label.bind('<Button-1>', lambda e, uid=user_id, uname=username: self._select_user(uid, uname))
+        
+        # Solo button
+        solo_active = user_id in self.solo_users
+        solo_bg = "#228B22" if solo_active else "#90EE90"
+        solo_btn = tk.Button(row_frame, text="S", bg=solo_bg, width=3, height=1,
+                           command=lambda uid=user_id, uname=username: self._toggle_solo(uid, uname))
+        solo_btn.pack(side=tk.LEFT, padx=2)
+        
+        # Mute button
+        mute_active = user_id in self.muted_users
+        mute_bg = "#CC0000" if mute_active else "#FFB6C1"
+        mute_btn = tk.Button(row_frame, text="M", bg=mute_bg, width=3, height=1,
+                           command=lambda uid=user_id, uname=username: self._toggle_mute(uid, uname))
+        mute_btn.pack(side=tk.LEFT, padx=2)
+        
+        # Volume slider
+        user_volume = self.user_volumes.get(user_id, 1.0)
+        volume_var = tk.DoubleVar(value=user_volume)
+        volume_scale = ttk.Scale(row_frame, from_=0.0, to=2.0, variable=volume_var, orient=tk.HORIZONTAL)
+        volume_scale.pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
+        volume_label = ttk.Label(row_frame, text=f"{user_volume:.1f}", width=3)
+        volume_label.pack(side=tk.LEFT, padx=2)
+        volume_var.trace('w', lambda *args, uid=user_id, uname=username: self._on_user_volume_change(uid, uname))
+        
+        # Device ID label
+        ttk.Label(row_frame, text=device_id, anchor=tk.W, width=18).pack(side=tk.LEFT, padx=5)
+        
+        # IP address label
+        ttk.Label(row_frame, text=ip_addr, anchor=tk.W, width=15).pack(side=tk.LEFT, padx=5)
+        
+        # Fingerprint label
+        ttk.Label(row_frame, text=fingerprint, anchor=tk.W).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        
+        # Store button references
+        self.user_buttons[user_id] = {
+            "solo": solo_btn,
+            "mute": mute_btn,
+            "name_label": name_label,
+            "volume_var": volume_var,
+            "volume_scale": volume_scale,
+            "volume_label": volume_label,
+            "row_frame": row_frame
+        }
+    
+    def _update_empty_label(self, has_visible_users):
+        """Show or hide the 'no users online' label."""
+        for widget in self.users_scroll_frame.winfo_children():
+            if isinstance(widget, ttk.Label) and widget.cget("text") == "(暂无用户在线)":
+                if has_visible_users:
+                    widget.pack_forget()
+                return
+        
+        if not has_visible_users:
+            ttk.Label(self.users_scroll_frame, text="(暂无用户在线)", foreground="gray").pack(pady=10)
     
     def _extract_username(self, user_text: str) -> str:
         """Extract username from user list text format: [ID:123] username [...]"""
@@ -731,6 +660,7 @@ class AdminGUI:
         self.selected_user_id = user_id
         self.selected_user_var.set(f"已选择: {username}")
         self.ban_btn.config(state=tk.NORMAL)
+        self.kick_btn.config(state=tk.NORMAL)
         
         # Highlight selected user name
         for uid, btns in self.user_buttons.items():
@@ -784,8 +714,22 @@ class AdminGUI:
             self._log(f"已设置用户 {username} 的音量为 {new_volume:.1f}")
     
     def _apply_user_volume(self, data: bytes, user_id: int) -> bytes:
-        """Apply per-user volume to audio data."""
+        """Apply per-user volume to audio data with active speaker normalization.
+        
+        actual_volume = volume_setting * (1 / unmuted_active_speaker_count)
+        Clean up stale speakers (no audio for >2 seconds).
+        Only unmuted (not in muted_users) active speakers count toward normalization.
+        """
         volume = self.user_volumes.get(user_id, 1.0)
+        # Clean up stale speakers and count active ones
+        now = time.time()
+        stale = [uid for uid, t in self._active_audio_users.items() if now - t > 2.0]
+        for uid in stale:
+            del self._active_audio_users[uid]
+        # Only count unmuted users in active_count
+        unmuted_active = [uid for uid in self._active_audio_users if uid not in self.muted_users]
+        active_count = max(1, len(unmuted_active))
+        volume = volume / active_count
         if volume == 1.0:
             return data
         samples = array.array('h', data)
@@ -814,33 +758,28 @@ class AdminGUI:
         
         reason = reason.strip() if reason else ""
         
-        # Send ban command to server
-        if not self.sock_audio:
+        # Send ban command to server via RUDP
+        if not self.rudp_endpoint:
             messagebox.showerror("错误", "未连接到服务器")
             return
         
         try:
-            target_name_bytes = username.encode('utf-8')
-            reason_bytes = reason.encode('utf-8')
-            
-            ban_data = (
-                struct.pack('!I', len(target_name_bytes)) + target_name_bytes +
-                struct.pack('!I', len(reason_bytes)) + reason_bytes
-            )
+            ban_data = json.dumps({"user_id": user_id, "reason": reason}).encode('utf-8')
             
             if self.audio_encryptor:
                 encrypted_data = self.audio_encryptor.encrypt(ban_data)
-                ban_packet = struct.pack('!B', MSG_TYPE_ADMIN_BAN) + struct.pack('!I', len(encrypted_data)) + encrypted_data
+                ban_payload = struct.pack('!I', len(encrypted_data)) + encrypted_data
             else:
-                ban_packet = struct.pack('!B', MSG_TYPE_ADMIN_BAN) + struct.pack('!I', len(ban_data)) + ban_data
+                ban_payload = struct.pack('!I', len(ban_data)) + ban_data
             
-            self.sock_audio.sendall(ban_packet)
+            self.rudp_endpoint.send(MSG_TYPE_ADMIN_BAN, ban_payload, timeout=5)
             self._log(f"已发送封禁命令: 用户 '{username}' (原因: {reason or '无'})")
             
             # Clear selection
             self.selected_user_id = None
             self.selected_user_var.set("未选择用户")
             self.ban_btn.config(state=tk.DISABLED)
+            self.kick_btn.config(state=tk.DISABLED)
             # Reset name label highlighting
             for uid, btns in self.user_buttons.items():
                 btns["name_label"].config(foreground="black", font=('', 9, 'normal'))
@@ -848,6 +787,42 @@ class AdminGUI:
         except Exception as e:
             self._log(f"发送封禁命令失败: {e}")
             messagebox.showerror("错误", f"发送封禁命令失败: {e}")
+    
+    def _kick_selected_user(self):
+        """Kick selected user (disconnect without banning)."""
+        user_id = self.selected_user_id
+        if user_id is None:
+            messagebox.showwarning("未选择用户", "请先在用户列表中选择一个用户")
+            return
+        
+        if not self.connected or not self.rudp_endpoint:
+            messagebox.showerror("错误", "未连接到服务器")
+            return
+        
+        try:
+            kick_data = json.dumps({"user_id": user_id}).encode('utf-8')
+            
+            if self.audio_encryptor:
+                encrypted_data = self.audio_encryptor.encrypt(kick_data)
+                kick_payload = struct.pack('!I', len(encrypted_data)) + encrypted_data
+            else:
+                kick_payload = struct.pack('!I', len(kick_data)) + kick_data
+            
+            self.rudp_endpoint.send(MSG_TYPE_ADMIN_KICK, kick_payload, timeout=5)
+            self._log(f"已发送踢出命令: 用户 '{user_id}'")
+            
+            # Clear selection
+            self.selected_user_id = None
+            self.selected_user_var.set("未选择用户")
+            self.ban_btn.config(state=tk.DISABLED)
+            self.kick_btn.config(state=tk.DISABLED)
+            # Reset name label highlighting
+            for uid, btns in self.user_buttons.items():
+                btns["name_label"].config(foreground="black", font=('', 9, 'normal'))
+            
+        except Exception as e:
+            self._log(f"发送踢出命令失败: {e}")
+            messagebox.showerror("错误", f"发送踢出命令失败: {e}")
     
     def _extract_user_id(self, user_text: str) -> int:
         """Extract user_id from user list text format: [ID:123] username [...]"""
@@ -872,20 +847,20 @@ class AdminGUI:
             self.unban_btn.config(state=tk.DISABLED)
     
     def _refresh_ban_list(self):
-        """Request ban list from server."""
-        if not self.sock_audio:
+        """Request ban list from server via RUDP."""
+        if not self.rudp_endpoint:
             messagebox.showwarning("警告", "请先连接服务器")
             return
         
         try:
-            # Send request: [msg_type(1)][encrypted_len(4)][encrypted_data]
+            # Send request via RUDP
             request_data = b''
             if self.audio_encryptor:
                 encrypted_data = self.audio_encryptor.encrypt(request_data)
-                request_packet = struct.pack('!B', MSG_TYPE_ADMIN_GET_BAN_LIST) + struct.pack('!I', len(encrypted_data)) + encrypted_data
+                request_payload = struct.pack('!I', len(encrypted_data)) + encrypted_data
             else:
-                request_packet = struct.pack('!B', MSG_TYPE_ADMIN_GET_BAN_LIST) + struct.pack('!I', len(request_data)) + request_data
-            self.sock_audio.sendall(request_packet)
+                request_payload = struct.pack('!I', len(request_data)) + request_data
+            self.rudp_endpoint.send(MSG_TYPE_ADMIN_GET_BAN_LIST, request_payload, timeout=5)
             self._log("已请求刷新封禁列表")
         except Exception as e:
             self._log(f"发送请求失败: {e}")
@@ -904,13 +879,16 @@ class AdminGUI:
             
             # Format fingerprints: group hardware and IP separately
             fps = device.get("fingerprints", [])
-            hw_fps = [fp for fp in fps if fp['type'] != 'ip']
-            ip_fps = [fp for fp in fps if fp['type'] == 'ip']
+            if not isinstance(fps, list):
+                # Handle old format where fingerprints was a dict
+                fps = []
+            hw_fps = [fp for fp in fps if isinstance(fp, dict) and fp.get('type') != 'ip']
+            ip_fps = [fp for fp in fps if isinstance(fp, dict) and fp.get('type') == 'ip']
             
             # Hardware fingerprints summary
             hw_parts = []
             for fp in hw_fps:
-                fp_str = f"{fp['type']}:{fp['value_short']}"
+                fp_str = f"{fp.get('type', '?')}:{fp.get('value_short', fp.get('value', '?')[:8] + '...')}"
                 hw_parts.append(fp_str)
             
             # Add IP info to hardware fingerprints if present
@@ -968,22 +946,21 @@ class AdminGUI:
         if not messagebox.askyesno("确认解封", f"确定要解封设备 '{device_id}' 吗？\n\n解封后该设备的所有硬件指纹将不再被封禁。"):
             return
         
-        if not self.sock_audio:
+        if not self.rudp_endpoint:
             messagebox.showerror("错误", "未连接到服务器")
             return
         
         try:
-            # Send unban command: [msg_type(1)][encrypted_len(4)][encrypted_data]
-            device_key_bytes = device_id.encode('utf-8')
-            unban_data = struct.pack('!I', len(device_key_bytes)) + device_key_bytes
+            # Send unban command via RUDP
+            unban_data = json.dumps({"device_key": device_id}).encode('utf-8')
             
             if self.audio_encryptor:
                 encrypted_data = self.audio_encryptor.encrypt(unban_data)
-                unban_packet = struct.pack('!B', MSG_TYPE_ADMIN_UNBAN) + struct.pack('!I', len(encrypted_data)) + encrypted_data
+                unban_payload = struct.pack('!I', len(encrypted_data)) + encrypted_data
             else:
-                unban_packet = struct.pack('!B', MSG_TYPE_ADMIN_UNBAN) + struct.pack('!I', len(unban_data)) + unban_data
+                unban_payload = struct.pack('!I', len(unban_data)) + unban_data
             
-            self.sock_audio.sendall(unban_packet)
+            self.rudp_endpoint.send(MSG_TYPE_ADMIN_UNBAN, unban_payload, timeout=5)
             self._log(f"已发送解封命令: 设备 '{device_id}'")
             
             # Clear selection
@@ -1069,7 +1046,10 @@ class AdminGUI:
             self._connect_lock = False
         
     def _connect_thread(self, host, port, name, password, volume):
-        """Background thread to establish connection to server."""
+        """Background thread to establish connection to server using UDP+RUDP."""
+        # Store params for auto-reconnection
+        self._reconnect_params = (host, port, name, password, volume)
+        self._auto_reconnect = True
         try:
             # Ensure old connection is fully cleaned up
             self.running = False
@@ -1088,132 +1068,132 @@ class AdminGUI:
             # Wait for socket to fully close
             time.sleep(0.3)
             
-            self.compressor = AudioCompressor(level=6)
+            self.compressor = AudioCompressor(bitrate=32000)
+            self.server_addr = (host, port)
             
-            # Step 1: Temporary connection to receive server's RSA public key for fingerprint verification
-            self.sock_audio = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock_audio.settimeout(10)
-            self.sock_audio.connect((host, port))
+            # Step 1: Create UDP socket for all communication
+            self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp_sock.settimeout(5)  # 5 second timeout for auth
+            self.udp_sock.bind(('0.0.0.0', 0))
+            self.root.after(0, self._log, f"UDP套接字已创建，本地端口: {self.udp_sock.getsockname()[1]}")
             
-            # Step 2: Receive RSA public key from server
-            pub_key_len_data = self._recv_exact(4)
-            if not pub_key_len_data:
-                self.root.after(0, self._connect_failed, "服务器响应格式错误")
-                return
+            # Step 2: Create RUDP endpoint for reliable control messages
+            self.rudp_endpoint = RUDPEndpoint(self.udp_sock, self.server_addr)
             
-            pub_key_len = struct.unpack('!I', pub_key_len_data)[0]
-            public_key_bytes = self._recv_exact(pub_key_len)
-            if not public_key_bytes:
-                self.root.after(0, self._connect_failed, "服务器公钥接收失败")
-                return
+            # Step 3: Request RSA public key from server (empty payload)
+            self.root.after(0, self._log, f"正在连接 {host}:{port}...")
+            self.root.after(0, self._log, "请求服务器 RSA 公钥...")
             
-            # Step 3: Close temporary connection before showing fingerprint dialog
-            self.sock_audio.close()
-            self.sock_audio = None
-            self.root.after(0, self._log, "等待用户确认服务器指纹...")
+            # Use send_and_wait for reliable delivery of RSA key request
+            result = self.rudp_endpoint.send_and_wait(MSG_TYPE_ADMIN_JOIN, b'', timeout=10)
+            if result is None:
+                raise Exception("服务器无响应，获取RSA公钥超时")
+            
+            msg_type, payload = result
+            if msg_type != MSG_TYPE_ADMIN_JOIN:
+                raise Exception(f"收到意外的消息类型: {msg_type}")
+            
+            # Parse public key: [pub_key_len(4)][public_key_bytes]
+            if len(payload) < 4:
+                raise Exception("服务器响应格式错误")
+            pub_key_len = struct.unpack('!I', payload[:4])[0]
+            public_key_bytes = payload[4:4+pub_key_len]
             
             # Step 4: Verify server fingerprint (SSH-style trust)
-            server_addr = f"{host}:{port}"
-            if not self._verify_server_fingerprint(server_addr, public_key_bytes):
-                self.root.after(0, self._connect_failed, "服务器指纹验证失败，连接已终止")
-                return
+            server_addr_str = f"{host}:{port}"
+            if not self._verify_server_fingerprint(server_addr_str, public_key_bytes):
+                raise Exception("服务器指纹验证失败，连接已终止")
             
-            # Step 5: User approved, establish actual connection
-            self.sock_audio = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock_audio.settimeout(10)
-            self.sock_audio.connect((host, port))
-            # Keep blocking mode with timeout for handshake
+            self.root.after(0, self._log, "服务器指纹验证通过")
             
-            # Step 6: Receive RSA public key again (new connection)
-            pub_key_len_data = self._recv_exact(4)
-            if not pub_key_len_data:
-                self.root.after(0, self._connect_failed, "服务器响应格式错误")
-                return
-            
-            pub_key_len = struct.unpack('!I', pub_key_len_data)[0]
-            public_key_bytes = self._recv_exact(pub_key_len)
-            if not public_key_bytes:
-                self.root.after(0, self._connect_failed, "服务器公钥接收失败")
-                return
-            
-            # Step 7: Encrypt password with RSA public key
+            # Step 5: Encrypt password with RSA public key
             public_key = RSA.import_key(public_key_bytes)
             cipher = PKCS1_OAEP.new(public_key)
             encrypted_password = cipher.encrypt(password.encode('utf-8'))
             
-            # Step 8: Get device fingerprints
-            device_fingerprints = get_device_fingerprint()
+            self.root.after(0, self._log, f"密码已使用 RSA-2048 加密")
             
-            # Step 9: Send JOIN packet with encrypted password and device fingerprints
+            # Step 6: Get device fingerprints
+            device_fingerprints = get_device_fingerprint()
+            fp_summary = f"MAC:{device_fingerprints['mac'][:16]} CPU:{device_fingerprints['cpu'][:16]}"
+            self.root.after(0, self._log, f"设备指纹: {fp_summary}")
+            
+            # Step 7: Send ADMIN_JOIN packet with encrypted password and device fingerprints
             name_bytes = name.encode('utf-8')
             fingerprints_json = json.dumps(device_fingerprints).encode('utf-8')
-            join_packet = (
-                struct.pack('!BI', MSG_TYPE_ADMIN_JOIN, len(name_bytes)) + name_bytes +
+            join_data = (
+                struct.pack('!I', len(name_bytes)) + name_bytes +
                 struct.pack('!I', len(encrypted_password)) + encrypted_password +
                 struct.pack('!I', len(fingerprints_json)) + fingerprints_json
             )
-            self.sock_audio.sendall(join_packet)
             
-            # Set timeout for receiving response
-            self.sock_audio.settimeout(15)
-            try:
-                response_type_data = self._recv_exact(1)
-                if not response_type_data:
-                    self.root.after(0, self._connect_failed, "服务器无响应，连接超时")
-                    return
-            except socket.timeout:
-                self.root.after(0, self._connect_failed, "等待服务器响应超时")
-                return
+            self.root.after(0, self._log, f"发送加入请求，包大小: {len(join_data)} 字节")
             
-            response_type = struct.unpack('!B', response_type_data[:1])[0]
+            # Use RUDP send_and_wait for reliable delivery
+            result = self.rudp_endpoint.send_and_wait(MSG_TYPE_ADMIN_JOIN, join_data, timeout=15)
+            if result is None:
+                raise Exception("服务器无响应，认证超时")
             
-            if response_type == MSG_TYPE_AUTH_FAIL:
-                self.root.after(0, self._connect_failed, "密码错误，身份验证失败")
-                return
-            elif response_type == MSG_TYPE_AUTH_SUCCESS:
+            msg_type, payload = result
+            self.root.after(0, self._log, f"收到响应类型: {msg_type}")
+            
+            if msg_type == MSG_TYPE_AUTH_FAIL:
+                raise Exception("密码错误，身份验证失败")
+            elif msg_type == MSG_TYPE_AUTH_SUCCESS:
                 # Format: [salt(32)][nonce(12)][tag(16)][encrypted_session_key(32)][user_id(4)]
-                response_data = self._recv_exact(96)
-                if not response_data or len(response_data) < 96:
-                    self.root.after(0, self._connect_failed, "服务器响应格式错误")
-                    return
+                if len(payload) < 96:
+                    raise Exception("服务器响应格式错误")
                 
-                salt = response_data[0:32]
-                nonce = response_data[32:44]
-                tag = response_data[44:60]
-                encrypted_session_key = response_data[60:92]
-                self.my_user_id = struct.unpack('!I', response_data[92:96])[0]
+                salt = payload[0:32]
+                nonce = payload[32:44]
+                tag = payload[44:60]
+                encrypted_session_key = payload[60:92]
+                self.my_user_id = struct.unpack('!I', payload[92:96])[0]
                 
-                # Use server-provided random salt (more secure than deriving salt from password)
+                # Derive session key
                 derived_key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
                 cipher = AES.new(derived_key, AES.MODE_GCM, nonce=nonce)
                 self.session_key = cipher.decrypt_and_verify(encrypted_session_key, tag)
                 
                 self.audio_encryptor = SessionKeyEncryptor(self.session_key)
-                
-                connected = True
+                self.root.after(0, self._log, f"认证成功，user_id: {self.my_user_id}")
             else:
-                self.root.after(0, self._connect_failed, "未知的服务器响应")
-                return
-                
+                raise Exception("未知的服务器响应")
+            
             self.p = pyaudio.PyAudio()
             self.player = AudioPlayer(self.p, volume=volume)
             
             self.running = True
             self.connected = True
             
-            receive_thread = threading.Thread(target=self._receive_audio, daemon=True)
+            # Create packet queue for decoupling recv from processing
+            self._packet_queue = queue.Queue(maxsize=2000)
+            
+            # Start heartbeat thread (via RUDP)
+            heartbeat_thread = threading.Thread(target=self._send_heartbeat, name='heartbeat', daemon=True)
+            heartbeat_thread.start()
+            self._active_threads.append(heartbeat_thread)
+            
+            # Start receive thread (UDP only, fast path)
+            receive_thread = threading.Thread(target=self._receive_loop, name='receive_loop', daemon=True)
             receive_thread.start()
             self._active_threads.append(receive_thread)
             
-            # Start heartbeat thread to keep connection alive
-            heartbeat_thread = threading.Thread(target=self._send_heartbeat, daemon=True)
-            heartbeat_thread.start()
-            self._active_threads.append(heartbeat_thread)
+            # Start process thread (handles audio + control messages)
+            process_thread = threading.Thread(target=self._process_loop, name='process_loop', daemon=True)
+            process_thread.start()
+            self._active_threads.append(process_thread)
+            
+            # Initialize last packet time and start connection watchdog
+            self.last_packet_time = time.time()
+            watchdog_thread = threading.Thread(target=self._connection_watchdog, name='watchdog', daemon=True)
+            watchdog_thread.start()
+            self._active_threads.append(watchdog_thread)
             
             self.root.after(0, self._connect_success, name)
             
         except Exception as e:
-            self.root.after(0, self._connect_failed, f"连接出错: {e}")
+            self.root.after(0, self._connect_failed, str(e))
             
     def _connect_success(self, name):
         """Update UI after successful connection."""
@@ -1229,6 +1209,11 @@ class AdminGUI:
         self.solo_users.clear()
         self.muted_users.clear()
         self.selected_user_id = None
+        self.ban_btn.config(state=tk.DISABLED)
+        self.kick_btn.config(state=tk.DISABLED)
+        
+        # Clear old user list display (prevent duplicates after reconnect)
+        self._clear_user_list()
         
         # Auto-request ban list after connecting
         self.root.after(500, self._refresh_ban_list)
@@ -1243,24 +1228,28 @@ class AdminGUI:
         self._log(message)
         self._cleanup()
         
+        # Clear user list display
+        self.root.after(0, self._clear_user_list)
+    
     def _disconnect(self):
         """Disconnect from server and clean up resources."""
+        self._auto_reconnect = False  # User manually disconnected
         self.running = False
         self.connected = False
         
-        # Send LEAVE message
+        # Send LEAVE message via RUDP
         try:
-            if self.name and self.sock_audio:
+            if self.name and self.rudp_endpoint:
                 name_bytes = self.name.encode('utf-8')
                 if self.audio_encryptor:
                     # Encrypt leave data
                     encrypted_data = self.audio_encryptor.encrypt(name_bytes)
-                    leave_packet = struct.pack('!B', MSG_TYPE_LEAVE) + struct.pack('!I', len(encrypted_data)) + encrypted_data
+                    leave_payload = struct.pack('!I', len(encrypted_data)) + encrypted_data
                 else:
-                    leave_packet = struct.pack('!BI', MSG_TYPE_LEAVE, len(name_bytes)) + name_bytes
-                self.sock_audio.sendall(leave_packet)
+                    leave_payload = struct.pack('!I', len(name_bytes)) + name_bytes
+                self.rudp_endpoint.send_raw(MSG_TYPE_LEAVE, leave_payload)
                 import time
-                time.sleep(0.3)
+                time.sleep(0.2)
         except Exception:
             pass
         
@@ -1269,6 +1258,9 @@ class AdminGUI:
         self.status_label.config(foreground="red")
         self._log("已断开连接")
         self._cleanup()
+        
+        # Clear user list display
+        self.root.after(0, self._clear_user_list)
         
     def _cleanup(self):
         """Clean up all network and audio resources."""
@@ -1287,7 +1279,7 @@ class AdminGUI:
                 pass
             self.player = None
             
-        # Close network socket
+        # Close network socket (TCP, no longer used)
         if self.sock_audio:
             try:
                 self.sock_audio.close()
@@ -1295,7 +1287,23 @@ class AdminGUI:
                 pass
             self.sock_audio = None
         
-        # Close signal socket
+        # Close UDP socket
+        if self.udp_sock:
+            try:
+                self.udp_sock.close()
+            except Exception:
+                pass
+            self.udp_sock = None
+        
+        # Close RUDP endpoint
+        if self.rudp_endpoint:
+            try:
+                self.rudp_endpoint.close()
+            except Exception:
+                pass
+            self.rudp_endpoint = None
+        
+        # Close signal socket (no longer used)
         if self.sock_signal:
             try:
                 self.sock_signal.close()
@@ -1303,9 +1311,10 @@ class AdminGUI:
                 pass
             self.sock_signal = None
             
-        # Wait for active threads to finish
+        # Wait for active threads to finish (skip current thread)
+        current = threading.current_thread()
         for t in self._active_threads:
-            if t.is_alive():
+            if t is not current and t.is_alive():
                 t.join(timeout=1.0)
         self._active_threads.clear()
             
@@ -1327,28 +1336,265 @@ class AdminGUI:
         self.monitoring_user_id = None
             
     def _send_heartbeat(self):
-        """Send heartbeat packets to server to keep connection alive."""
+        """Send heartbeat packets to server via RUDP to keep connection alive."""
         import time
         while self.running and self.connected:
             try:
-                if self.sock_audio and self.name:
+                if self.name and self.rudp_endpoint:
                     name_bytes = self.name.encode('utf-8')
                     if self.audio_encryptor:
                         # Encrypt heartbeat data
                         encrypted_data = self.audio_encryptor.encrypt(name_bytes)
-                        heartbeat_packet = struct.pack('!B', MSG_TYPE_HEARTBEAT) + struct.pack('!I', len(encrypted_data)) + encrypted_data
+                        heartbeat_payload = struct.pack('!I', len(encrypted_data)) + encrypted_data
                     else:
                         # Fallback to plaintext
-                        heartbeat_packet = struct.pack('!BI', MSG_TYPE_HEARTBEAT, len(name_bytes)) + name_bytes
-                    self.sock_audio.sendall(heartbeat_packet)
+                        heartbeat_payload = struct.pack('!I', len(name_bytes)) + name_bytes
+                    # Fire-and-forget, no ACK needed for heartbeat
+                    self.rudp_endpoint.send_raw(MSG_TYPE_HEARTBEAT, heartbeat_payload)
                 time.sleep(3)
             except Exception:
                 time.sleep(3)
                 
-    def _receive_audio(self):
-        """Receive and process incoming audio from server via TCP."""
-        self._log("开始接收音频（监听模式）...")
-        packet_count = 0
+    def _receive_loop(self):
+        """Fast receive loop - only queues packets, no processing.
+        
+        All processing (audio decryption, control message handling) is done
+        in the separate _process_loop to prevent control messages from
+        blocking audio packet reception.
+        """
+        self._log("开始通过UDP接收音频和控制消息...")
+        
+        while self.running:
+            if self.udp_sock is None:
+                time.sleep(0.1)
+                continue
+            
+            try:
+                data, addr = self.udp_sock.recvfrom(MAX_PACKET_SIZE)
+                if not data or len(data) < 1:
+                    continue
+                
+                self.last_packet_time = time.time()
+                
+                try:
+                    self._packet_queue.put_nowait((data, addr))
+                except queue.Full:
+                    pass  # Drop oldest implicitly
+                    
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.running:
+                    time.sleep(0.01)
+                continue
+            except Exception as e:
+                if self.running:
+                    self._log(f"UDP接收出错: {e}")
+                time.sleep(0.1)
+    
+    def _process_loop(self):
+        """Process loop - handles audio and control messages from the queue.
+        
+        Runs in a separate thread from _receive_loop so that control message
+        processing (e.g., ban list decryption + JSON parsing) never blocks
+        audio packet reception.
+        """
+        audio_count = 0
+        
+        while self.running:
+            try:
+                data, addr = self._packet_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            
+            try:
+                msg_type = struct.unpack('!B', data[:1])[0]
+                
+                if msg_type == MSG_TYPE_AUDIO:
+                    # Parse audio packet: [msg_type(1)][sender_id(4)][sender_name_len(1)][sender_name(N)][timestamp(8)][encrypted_len(4)][encrypted_audio]
+                    if len(data) < 14:
+                        continue
+                    
+                    sender_id = struct.unpack('!I', data[1:5])[0]
+                    sender_name_len = struct.unpack('!B', data[5:6])[0]
+                    
+                    if len(data) < 6 + sender_name_len + 12:
+                        continue
+                    
+                    sender_name = data[6:6+sender_name_len].decode('utf-8')
+                    offset = 6 + sender_name_len
+                    
+                    encrypted_len = struct.unpack('!I', data[offset+8:offset+12])[0]
+                    if len(data) < offset + 12 + encrypted_len:
+                        continue
+                    
+                    encrypted_data = data[offset+12:offset+12+encrypted_len]
+                    
+                    # Check mute/solo/monitoring logic
+                    if sender_id in self.muted_users:
+                        continue
+                    
+                    if self.solo_users:
+                        if sender_id not in self.solo_users:
+                            continue
+                    
+                    if self.monitoring_user_id is not None and sender_id != self.monitoring_user_id:
+                        continue
+                    
+                    if not self.audio_encryptor:
+                        continue
+                    
+                    audio_count += 1
+                    compressed_data = self.audio_encryptor.decrypt(encrypted_data)
+                    if compressed_data and self.compressor:
+                        pcm_data = self.compressor.decompress(compressed_data, user_id=sender_id)
+                        self._active_audio_users[sender_id] = time.time()
+                        pcm_data = self._apply_user_volume(pcm_data, sender_id)
+                        if self.player:
+                            self.player.push(sender_id, pcm_data)
+                            
+                else:
+                    # Control message - handle via RUDP
+                    result = self.rudp_endpoint.handle_incoming(data)
+                    if result is not None:
+                        ctrl_msg_type, payload = result
+                        self._handle_control_message(ctrl_msg_type, payload)
+                        
+            except Exception as e:
+                if self.running:
+                    self._log(f"处理数据包出错: {e}")
+    
+    def _handle_control_message(self, msg_type, payload):
+        """Handle a control message received via RUDP."""
+        try:
+            if msg_type == MSG_TYPE_USER_LIST:
+                if self.audio_encryptor:
+                    decrypted_data = self.audio_encryptor.decrypt(payload)
+                    if decrypted_data:
+                        user_list_data = decrypted_data.decode('utf-8')
+                        self.root.after(0, self._update_users, user_list_data)
+                        
+            elif msg_type == MSG_TYPE_BAN_LIST:
+                if self.audio_encryptor:
+                    decrypted_data = self.audio_encryptor.decrypt(payload)
+                    if decrypted_data:
+                        try:
+                            ban_list_data = json.loads(decrypted_data.decode('utf-8'))
+                            self.root.after(0, self._update_ban_list, ban_list_data)
+                        except Exception as e:
+                            self._log(f"解析封禁列表失败: {e}")
+                            
+            elif msg_type == MSG_TYPE_USER_JOINED:
+                if self.audio_encryptor:
+                    decrypted_data = self.audio_encryptor.decrypt(payload)
+                    if decrypted_data:
+                        event_data = decrypted_data.decode('utf-8')
+                        self.root.after(0, self._log, f"[用户事件] {event_data}")
+                        
+            elif msg_type == MSG_TYPE_LEAVE:
+                if self.audio_encryptor:
+                    decrypted_data = self.audio_encryptor.decrypt(payload)
+                    if decrypted_data:
+                        event_data = decrypted_data.decode('utf-8')
+                        self.root.after(0, self._log, f"[用户离开] {event_data}")
+                        
+            elif msg_type == MSG_TYPE_HEARTBEAT:
+                # Server heartbeat response, ignore
+                pass
+                
+            elif msg_type == MSG_TYPE_TEXT_MESSAGE:
+                if self.audio_encryptor:
+                    decrypted_data = self.audio_encryptor.decrypt(payload)
+                    if decrypted_data:
+                        text = decrypted_data.decode('utf-8')
+                        self.root.after(0, self._display_text_message, text)
+                
+            else:
+                self._log(f"收到未知控制消息类型: {msg_type}")
+                
+        except Exception as e:
+            self._log(f"处理控制消息失败: {e}")
+    
+    def _display_text_message(self, text: str):
+        """Display a text chat message in the chat panel."""
+        if hasattr(self, 'chat_text') and self.chat_text.winfo_exists():
+            self.chat_text.config(state=tk.NORMAL)
+            self.chat_text.insert(tk.END, text + "\n")
+            self.chat_text.see(tk.END)
+            self.chat_text.config(state=tk.DISABLED)
+    
+    def _send_text_message(self, event=None):
+        """Send a text chat message via RUDP."""
+        if not hasattr(self, 'chat_input') or not self.chat_input.winfo_exists():
+            return
+        if not self.connected:
+            self._log("未连接，无法发送文字消息")
+            return
+        
+        text = self.chat_input.get().strip()
+        if not text:
+            return
+        if len(text) > 200:
+            self._log(f"文字消息过长（{len(text)}字符），限制200字符")
+            return
+        
+        try:
+            encrypted = self.audio_encryptor.encrypt(text.encode('utf-8'))
+            self.rudp_endpoint.send_raw(MSG_TYPE_TEXT_CHAT, encrypted)
+            self.chat_input.delete(0, tk.END)
+        except Exception as e:
+            self._log(f"发送文字消息失败: {e}")
+    
+    def _connection_watchdog(self):
+        """Monitor connection health and trigger auto-reconnection.
+        
+        If no packets are received for 5 seconds, the server is
+        considered dead. The watchdog triggers a full reconnection
+        with exponential backoff (1s, 2s, 4s, ... up to 60s).
+        """
+        backoff = 1
+        
+        while self.running:
+            time.sleep(1)
+            
+            if not self._auto_reconnect:
+                continue
+            
+            if not self.connected:
+                continue
+            
+            elapsed = time.time() - self.last_packet_time
+            if elapsed > 5:
+                self._log(f"服务器连接丢失（{elapsed:.0f}秒无数据），{backoff}秒后重连...")
+                self.root.after(0, lambda: self.status_var.set("连接丢失，正在重连..."))
+                
+                self.connected = False
+                self.running = False
+                
+                time.sleep(1)
+                self._cleanup()
+                
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                
+                if self._reconnect_params and self._auto_reconnect:
+                    host, port, name, password, volume = self._reconnect_params
+                    self._log(f"正在重连 {host}:{port}...")
+                    try:
+                        self._connect_thread(host, port, name, password, volume)
+                        backoff = 1
+                    except Exception as e:
+                        self._log(f"重连失败: {e}")
+            else:
+                backoff = 1
+    
+    def _receive_control(self):
+        """Receive and process control messages from server via TCP.
+        
+        Audio is now handled by _receive_audio_udp via UDP.
+        This method handles TCP control messages (user list, ban list, events, etc.).
+        """
+        self._log("开始接收控制消息...")
         buffer = b''
         
         while self.running:
@@ -1364,70 +1610,17 @@ class AdminGUI:
                     msg_type = struct.unpack('!B', buffer[:1])[0]
                     
                     if msg_type == MSG_TYPE_AUDIO:
-                        # New format for admin: [msg_type(1)][sender_id(4)][sender_name_len(1)][sender_name(N)][timestamp(8)][encrypted_len(4)][encrypted_audio]
-                        if len(buffer) < 14:  # 1 + 4 + 1 + 8 + 4 minimum
+                        # Audio now comes via UDP, skip TCP audio packets
+                        if len(buffer) < 14:
                             break
-                        
-                        sender_id = struct.unpack('!I', buffer[1:5])[0]
                         sender_name_len = struct.unpack('!B', buffer[5:6])[0]
-                        
-                        if len(buffer) < 6 + sender_name_len + 12:
-                            break
-                        
-                        sender_name = buffer[6:6+sender_name_len].decode('utf-8')
                         offset = 6 + sender_name_len
-                        
-                        timestamp = struct.unpack('!d', buffer[offset:offset+8])[0]
+                        if len(buffer) < offset + 12:
+                            break
                         encrypted_len = struct.unpack('!I', buffer[offset+8:offset+12])[0]
-                        
                         if len(buffer) < offset + 12 + encrypted_len:
                             break
-                        
-                        encrypted_data = buffer[offset+12:offset+12+encrypted_len]
                         buffer = buffer[offset+12+encrypted_len:]
-                        
-                        packet_count += 1
-                        if packet_count <= 3:
-                            self._log(f"收到第 {packet_count} 个音频包 [ID:{sender_id}] {sender_name}，大小: {len(encrypted_data)}")
-                        
-                        # Check mute first: mute has highest priority, even over solo
-                        if sender_id in self.muted_users:
-                            if packet_count <= 3:
-                                self._log(f"跳过静音用户 [{sender_id}] {sender_name} 的音频")
-                            continue
-
-                        # If there are solo users, only play their audio
-                        if self.solo_users:
-                            if sender_id not in self.solo_users:
-                                if packet_count <= 3:
-                                    self._log(f"跳过非独听用户 [{sender_id}] {sender_name} 的音频")
-                                continue
-
-                        # Check if we should play this audio based on monitoring target
-                        if self.monitoring_user_id is not None and sender_id != self.monitoring_user_id:
-                            if packet_count <= 3:
-                                self._log(f"跳过非监听用户 [{sender_id}] {sender_name} 的音频")
-                            continue
-                        
-                        if not self.audio_encryptor:
-                            if packet_count <= 3:
-                                self._log("警告: audio_encryptor 未初始化")
-                            continue
-                        compressed_data = self.audio_encryptor.decrypt(encrypted_data)
-                        if compressed_data is None:
-                            if packet_count <= 3:
-                                self._log("警告: 解密失败")
-                            continue
-                        if packet_count <= 3:
-                            self._log(f"解密成功，压缩数据大小: {len(compressed_data)}")
-                        if compressed_data and self.compressor:
-                            pcm_data = self.compressor.decompress(compressed_data)
-                            if packet_count <= 3:
-                                self._log(f"解压成功，PCM数据大小: {len(pcm_data)}")
-                            # Apply per-user volume
-                            pcm_data = self._apply_user_volume(pcm_data, sender_id)
-                            if self.player:
-                                self.player.push(pcm_data)
                     elif msg_type == MSG_TYPE_USER_LIST:
                         # Format: [msg_type(1)][encrypted_len(4)][encrypted_data]
                         if len(buffer) < 5:
@@ -1509,26 +1702,7 @@ def main():
     parser.add_argument('--quiet', action='store_true', help='静默模式，不显示任何日志')
     parser.add_argument('--output-device', type=int, default=None, help='音频输出设备索引')
     parser.add_argument('--list-devices', action='store_true', help='列出所有音频设备')
-    parser.add_argument('--nogui', action='store_true', help='启动命令行界面（默认启动图形界面）')
     args = parser.parse_args()
-
-    if not args.nogui:
-        if not HAS_GUI:
-            print("错误: 未安装 tkinter，无法启动图形界面，请使用 --nogui 参数启动命令行版本")
-            return
-        
-        # 设置 DPI 感知，解决高分辨率屏幕下的模糊问题
-        try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        except Exception:
-            pass
-        
-        root = tk.Tk()
-        app = AdminGUI(root)
-        root.protocol("WM_DELETE_WINDOW", app.on_closing)
-        root.mainloop()
-        return
 
     if args.list_devices:
         p = pyaudio.PyAudio()
@@ -1541,255 +1715,13 @@ def main():
         p.terminate()
         return
 
-    if args.quiet:
-        logging.disable(logging.CRITICAL)
-    else:
-        logging.basicConfig(
-            level=getattr(logging, args.log_level),
-            format='%(asctime)s [%(levelname)s] %(message)s'
-        )
+    import ctypes
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
 
-    global RATE, CHUNK, CHANNELS, JITTER_BUFFER_SIZE
-    RATE = args.rate
-    CHUNK = args.chunk
-    CHANNELS = args.channels
-    JITTER_BUFFER_SIZE = args.jitter_buffer
-
-    host = args.host
-    port = args.admin_port
-
-    if args.name:
-        name = args.name
-    else:
-        name = input("管理员昵称: ").strip()
-        if not name:
-            name = "管理员"
-
-    if args.password:
-        password = args.password
-    else:
-        password = getpass.getpass("加密密码: ").strip()
-    
-    if not password:
-        logger.error("密码不能为空")
-        return
-    
-    compressor = AudioCompressor(level=args.compress_level)
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    
-    logger.info(f"正在连接服务器 {host}:{port}...")
-    
-    try:
-        sock.settimeout(10)
-        sock.connect((host, port))
-        sock.settimeout(None)
-    except Exception as e:
-        logger.error(f"无法连接到服务器 {host}:{port}: {e}")
-        sock.close()
-        return
-    
-    # Step 1: Receive RSA public key from server
-    logger.info("接收服务器 RSA 公钥...")
-    pub_key_len_data = b''
-    while len(pub_key_len_data) < 4:
-        chunk = sock.recv(4 - len(pub_key_len_data))
-        if not chunk:
-            logger.error("服务器响应格式错误")
-            sock.close()
-            return
-        pub_key_len_data += chunk
-    
-    pub_key_len = struct.unpack('!I', pub_key_len_data)[0]
-    public_key_bytes = b''
-    while len(public_key_bytes) < pub_key_len:
-        chunk = sock.recv(pub_key_len - len(public_key_bytes))
-        if not chunk:
-            logger.error("服务器公钥接收失败")
-            sock.close()
-            return
-        public_key_bytes += chunk
-    
-    # Step 2: Show fingerprint for verification
-    fingerprint = hashlib.sha256(public_key_bytes).hexdigest()
-    server_addr = f"{host}:{port}"
-    logger.info(f"服务器公钥指纹: {fingerprint}")
-    
-    # Load known servers for fingerprint verification
-    if getattr(sys, 'frozen', False):
-        base_dir = os.path.dirname(sys.executable)
-    else:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-    known_servers_file = os.path.join(base_dir, 'known_servers.json')
-    known_servers = load_known_servers(known_servers_file)
-    
-    # Verify fingerprint against known servers
-    if server_addr in known_servers:
-        if fingerprint != known_servers[server_addr]:
-            logger.error(f"SECURITY WARNING: Server fingerprint mismatch for {server_addr}!")
-            logger.error(f"Expected: {known_servers[server_addr]}")
-            logger.error(f"Received: {fingerprint}")
-            logger.error("This could be a man-in-the-middle attack!")
-            print("\n" + "="*60)
-            print("⚠️ 安全警告：服务器指纹不匹配！")
-            print("="*60)
-            print(f"之前记录的指纹: {known_servers[server_addr]}")
-            print(f"当前收到的指纹: {fingerprint}")
-            print("\n这可能是中间人攻击！")
-            override = input("是否仍然连接？(y/n) [n]: ").strip().lower()
-            if override != 'y':
-                logger.info("用户拒绝不匹配的指纹，连接已取消")
-                sock.close()
-                return
-            logger.warning("用户覆盖了指纹不匹配警告")
-        else:
-            logger.info(f"Server fingerprint verified for {server_addr}")
-            print(f"✅ 服务器指纹已验证: {fingerprint}")
-    else:
-        logger.info("请通过其他可信渠道验证此指纹")
-        
-        # Show user consent notice for CLI mode
-        print("\n" + "="*60)
-        print("【隐私与使用协议】")
-        print("="*60)
-        print("\n1. 设备指纹收集:")
-        print("   为便于服务器管理，我们将收集您的设备信息")
-        print("   （包括MAC地址、CPU ID等硬件标识符）")
-        print("\n2. 音频录制提示:")
-        print("   服务器可能会录制您的音频通话内容")
-        print("   （具体取决于服务器配置）")
-        print("\n3. 同意声明:")
-        print("   继续连接即表示您同意上述数据收集和使用")
-        print("\n4. 免责声明:")
-        print("   本软件基于MIT许可证发布，不提供任何担保。")
-        print("   开发者不对因使用本软件造成的任何后果承担责任。")
-        print("   请遵守当地法律法规，不当使用造成的后果由使用者自行承担。")
-        print("\n" + "="*60)
-        print(f"\n服务器公钥指纹 (SHA-256):\n  {fingerprint}\n")
-        
-        consent = input("\n是否继续连接？(y/n) [n]: ").strip().lower()
-        if consent != 'y':
-            logger.info("用户拒绝同意条款，连接已取消")
-            sock.close()
-            return
-        
-        logger.info("用户已同意条款，保存服务器指纹")
-        known_servers[server_addr] = fingerprint
-        save_known_servers(known_servers, known_servers_file)
-        logger.info(f"Server fingerprint saved for {server_addr}")
-    
-    # Step 3: Encrypt password with RSA public key
-    public_key = RSA.import_key(public_key_bytes)
-    cipher = PKCS1_OAEP.new(public_key)
-    encrypted_password = cipher.encrypt(password.encode('utf-8'))
-    logger.info("密码已使用 RSA-2048 加密")
-    
-    # Step 4: Get device fingerprints
-    device_fingerprints = get_device_fingerprint()
-    fp_summary = f"MAC:{device_fingerprints['mac'][:16]} CPU:{device_fingerprints['cpu'][:16]}"
-    logger.info(f"设备指纹: {fp_summary}")
-    
-    # Step 5: Send JOIN packet with encrypted password and device fingerprints
-    name_bytes = name.encode('utf-8')
-    fingerprints_json = json.dumps(device_fingerprints).encode('utf-8')
-    join_packet = (
-        struct.pack('!BI', MSG_TYPE_ADMIN_JOIN, len(name_bytes)) + name_bytes +
-        struct.pack('!I', len(encrypted_password)) + encrypted_password +
-        struct.pack('!I', len(fingerprints_json)) + fingerprints_json
-    )
-    sock.sendall(join_packet)
-    
-    response_data = b''
-    while len(response_data) < 93:
-        chunk = sock.recv(93 - len(response_data))
-        if not chunk:
-            logger.error("服务器响应不完整")
-            sock.close()
-            return
-        response_data += chunk
-    
-    if len(response_data) < 93:
-        logger.error("服务器响应格式错误")
-        sock.close()
-        return
-    
-    response_type = struct.unpack('!B', response_data[:1])[0]
-    
-    if response_type == MSG_TYPE_AUTH_FAIL:
-        logger.error("密码错误，身份验证失败")
-        sock.close()
-        return
-    elif response_type != MSG_TYPE_AUTH_SUCCESS:
-        logger.error("未知的服务器响应")
-        sock.close()
-        return
-    
-    nonce = response_data[33:45]
-    tag = response_data[45:61]
-    encrypted_session_key = response_data[61:93]
-    
-    salt = response_data[1:33]
-    derived_key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
-    cipher = AES.new(derived_key, AES.MODE_GCM, nonce=nonce)
-    session_key = cipher.decrypt_and_verify(encrypted_session_key, tag)
-    
-    audio_encryptor = SessionKeyEncryptor(session_key)
-    
-    logger.info(f"已以管理员身份加入服务器，昵称: {name}")
-        
-    print("=" * 50)
-    print("管理员监听模式已连接！")
-    print("您可以监听所有用户的语音，但无法说话。")
-    print("按 Ctrl+C 退出。")
-    print("=" * 50)
-
-    p = pyaudio.PyAudio()
-
-    player = AudioPlayer(p, volume=args.volume, output_device=args.output_device)
-
-    receive_thread = threading.Thread(target=receive_audio, args=(sock, player, audio_encryptor, compressor), daemon=True)
-    receive_thread.start()
-    
-    # Start heartbeat thread
-    def send_heartbeat_cli():
-        while True:
-            try:
-                name_bytes = name.encode('utf-8')
-                if audio_encryptor:
-                    # Encrypt heartbeat data
-                    encrypted_data = audio_encryptor.encrypt(name_bytes)
-                    heartbeat_packet = struct.pack('!B', MSG_TYPE_HEARTBEAT) + struct.pack('!I', len(encrypted_data)) + encrypted_data
-                else:
-                    # Fallback to plaintext
-                    heartbeat_packet = struct.pack('!BI', MSG_TYPE_HEARTBEAT, len(name_bytes)) + name_bytes
-                sock.sendall(heartbeat_packet)
-                time.sleep(3)
-            except Exception:
-                time.sleep(3)
-    
-    heartbeat_thread = threading.Thread(target=send_heartbeat_cli, daemon=True)
-    heartbeat_thread.start()
-
-    try:
-        while receive_thread.is_alive():
-            receive_thread.join(timeout=0.5)
-    except KeyboardInterrupt:
-        print("\n正在断开连接...")
-        try:
-            name_bytes = name.encode('utf-8')
-            if audio_encryptor:
-                encrypted_data = audio_encryptor.encrypt(name_bytes)
-                leave_packet = struct.pack('!B', MSG_TYPE_LEAVE) + struct.pack('!I', len(encrypted_data)) + encrypted_data
-            else:
-                leave_packet = struct.pack('!BI', MSG_TYPE_LEAVE, len(name_bytes)) + name_bytes
-            sock.sendall(leave_packet)
-        except Exception:
-            pass
-    finally:
-        player.stop()
-        sock.close()
-        p.terminate()
-        logger.info("已断开连接")
+    root = tk.Tk()
+    app = AdminGUI(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    root.mainloop()
 
 
 if __name__ == '__main__':

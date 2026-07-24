@@ -231,3 +231,8 @@ admin_icon.png
 version_client.txt
 version_admin.txt
 编译命令.md
+docker-compose.yml
+test.py
+.trae/
+helloworld.py
+recordings
